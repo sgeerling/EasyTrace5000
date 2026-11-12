@@ -3,736 +3,618 @@
  * @description Centralized application configuration
  * @author      Eltryus - Ricardo Marques
  * @copyright   2025-2026 Eltryus - Ricardo Marques
- * @see         {@link https://github.com/RicardoJCMarques/EasyTrace5000}
+ * @see         {@link https://github.com/RicardoJCMarques/EasyCAM5000}
  *
  * SPDX-FileCopyrightText: 2025-2026 Eltryus - Ricardo Marques
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-/*
- *
+/**
  * Architecture:
- *   config.constants - Frozen at runtime (Object.freeze). Algorithmic thresholds,
- *                      format specs, engine limits, UI schema. Never saved or exported.
- *   config.defaults  - Factory-reset values for all user-facing settings. Cloned by
- *                      SettingsManager on startup, overridable via JSON import.
- *   config.*()       - Helper methods (root level, read from both sections).
+ *  config.constants - Frozen at runtime (Object.freeze). Algorithmic thresholds,
+ *                     format specs, engine limits, UI schema. Never saved or exported.
+ *  config.defaults  - Factory-reset values for all user-facing settings. Cloned by
+ *                     CamCore.loadSettings which merges saved settings over the clone.
  */
+// `window` does not exist in a Web Worker. field-worker.js does NOT load this
+// file - it installs a function-stripped snapshot of `constants` from the job
+// payload as self.CAMConfig before importScripts, so the worker-clean modules
+// bind to a live object. The deep-freeze tail below resolves via globalThis.
+(typeof self !== 'undefined' ? self : window).CAMConfig = {
+  // ╔═══════════════════════════════════════════════════════════════════════╗
+  // ║ MACHINE PARAMETERS                                                    ║
+  // ║ Global settings form. The KEY is the settings path; the last segment  ║
+  // ║ is the parameter name, used for the en.json lookup, the DOM id and    ║
+  // ║ `conditional`. A post's or laser profile's own settings are not here  ║
+  // ║ - they come from its descriptor and are keyed by owner automatically. ║
+  // ║ An app removes an entry by setting it to null in its profile's        ║
+  // ║ machineParameters block.                                              ║
+  // ╚═══════════════════════════════════════════════════════════════════════╝
+  machineParameters: {
+    "gcode.postProcessor": { default: "grbl", type: "select", category: "post", source: "processors", classes: ["router"] },
+    "gcode.units": { default: "mm", type: "select", category: "post", capability: "supportsUnits", classes: ["router"], options: [{ value: "mm"}, { value: "inch"}] },
+    "gcode.lineNumbers": { default: false, type: "checkbox", category: "post", capability: "supportsLineNumbers", classes: ["router"] },
+    "gcode.lineNumberStep": { default: 10, type: "number", category: "post", capability: "supportsLineNumbers", classes: ["router"], conditional: "lineNumbers", min: 1, max: 1000, step: 1 },
+    "gcode.toolLengthCompMode": { default: "none", type: "select", category: "post", source: "tlcModes", classes: ["router"] },
+    "gcode.absoluteZ": { default: false, type: "checkbox", category: "post", capability: "supportsAbsoluteZ", classes: ["router"] }, // Machine Z0 is fixed (the bed), not touched off on the stock.
+    "machine.stock.thickness": { default: 1.8, type: "number", category: "stock", min: 0.1, step: 0.1, unit: "mm" },
+    "machine.stock.width": { default: 200, type: "number", category: "stock", min: 1, step: 1, unit: "mm" },
+    "machine.stock.length": { default: 150, type: "number", category: "stock", min: 1, step: 1, unit: "mm" },
+    "machine.stock.margin": { default: 0, type: "number", category: "stock", min: 0, step: 1, unit: "mm" }, // Clearance kept around the geometry when fitting stock to it.
+    "machine.stock.material": { default: "fr", type: "select", category: "stock", options: [
+      { value: "fr" },
+      { value: "plywood" },
+      { value: "mdf" },
+      { value: "hardwood" },
+      { value: "softwood" },
+      { value: "acrylic" },
+      { value: "aluminum" },
+      { value: "foam" },
+      { value: "custom" }
+    ] },
+    "machine.stock.zeroReference": { default: "material", type: "select", category: "stock", options: [{value: "material"}, {value: "bed"}] },
 
-window.CAMConfig = {
+    "machine.heights.safeZ": { default: 5, type: "number", category: "heights", step: 0.5, unit: "mm", classes: ["router"] },
+    "machine.heights.travelZ": { default: 2, type: "number", category: "heights", step: 0.5, unit: "mm", classes: ["router"] },
+    "machine.speeds.rapidFeed": { default: 1000, type: "number", category: "heights", step: 100, unit: "mm/min", classes: ["router"] },
+    "machine.coolant": { default: "none", type: "select", category: "heights", capability: "supportsCoolant", classes: ["router"], options: [{ value: "none" }, { value: "mist" }, { value: "flood" }] },
+    "machine.vacuum": { default: false, type: "checkbox", category: "heights", capability: "supportsCoolant", classes: ["router"] },
 
-    // ╔═══════════════════════════════════════════════════════════════════════╗
-    // ║  CONSTANTS                                                            ║
-    // ║  Frozen at runtime. Changing these breaks math, crashes WASM, or      ║
-    // ║  violates file format specs. Never persisted, exported, or imported.  ║
-    // ╚═══════════════════════════════════════════════════════════════════════╝
-    constants: {
+    "machine.heights.feedHeight": { default: 1 }, // Clearance above Z0 where the G0→G1 handoff occurs.
+    "machine.heights.maxSafeDepth": { default: -10.1 }, // Negative Z limit. Deeper values raise a warning at generation.
+    "machine.speeds.maxFeed": { default: 2000 },
 
-        // ====================================================================
-        // PRECISION
-        //
-        // Canonical tolerance values. Every module references these instead of
-        // hardcoding numbers. When adding a new tolerance, check if an existing
-        // one already covers the use case before creating a new entry.
-        //
-        // ====================================================================
-        precision: {
-            epsilon: 1e-9,              // Floating-point near-zero. Guard divisions, cross-product zero checks.
-            collinear: 1e-12,           // Stricter near-zero for geometric collinearity where even tiny deviations matter.
-            collinearDot: 0.995,        // Dot-product angle threshold. Unit vectors with dot > this are "parallel enough."
+    "gcode.rotaryAxis": { default: "x", type: "select", category: "rotary", classes: ["router"], invalidates: ["rotary"], options: [{ value: "x" }, { value: "y" }], }, // invalidates: the operation types whose generated geometry reads the setting - a change strikes them through.
+    "gcode.rotaryChuckSide": { default: "low", type: "select", category: "rotary", classes: ["router"], invalidates: ["rotary"], options: [{ value: "low" }, { value: "high" }], }, // The end of the rotary axis the chuck holds: chuck-end parameters apply there, tail-end ones at the other.
+    "gcode.rotaryRoute": { default: "off", type: "select", category: "rotary", source: "rotaryRoutes", classes: ["router"] }, // 'off' only where the active setup declares no route.
+    "gcode.indexDwell": { default: 0, type: "number", category: "rotary", min: 0, max: 5, step: 0.1, unit: "s", classes: ["router"] }, // Rotary index settling dwell, SECONDS.
+    "gcode.rotaryAxisHeight": { default: null, type: "number", category: "rotary", capability: "supportsAbsoluteZ", classes: ["router"], conditional: "absoluteZ", nullable: true, min: 0, step: 0.1, unit: "mm", }, // Rotation centerline above machine Z0. Unset, absolute Z refuses a 4th-axis export.
 
-            coordinate: 0.001,          // Coordinate quantization grid. All coordinates snap to this resolution.
+    'machine.view.rotaryGrid': { default: true, type: 'checkbox', category: 'rotary', classes: ['router'] }, // The 4th-axis scene's ground grid; display only.
+    'machine.view.rotaryWorkholding': { default: true, type: 'checkbox', category: 'rotary', classes: ['router'] }, // Its chuck and tailstock; display only.
 
-            rdpSimplification: 0.0005  // Douglas-Peucker polygon simplification.
-        },
+    "laser.activeProfile": { default: "xtoolstudio", type: "select", category: "laser", source: "laserProfiles", classes: ["laser"] },
+    "laser.spotSize": { default: 0.02, type: "number", category: "laser", min: 0.01, max: 1, step: 0.01, unit: "mm", classes: ["laser"] },
+    "laser.exportFormat": { default: "svg", type: "select", category: "laser", classes: ["laser"], options: [{ value: "svg" }, { value: "png" }] },
+    "laser.exportDPI": { default: 1000, type: "number", category: "laser", conditional: "exportFormat:png", classes: ["laser"], min: 100, max: 4000, step: 100, unit: "DPI" },
+    "laser.exportPadding": { default: 5.0 }
+  },
 
-        // ====================================================================
-        // GEOMETRY ENGINE
-        // ====================================================================
-        geometry: {
-            segments: {                 // Tessellation quality. Tuned for visual fidelity at PCB scale.
-                // REVIEW - these should all be dynamic in terms of size, arcs are either reconstructed (needs highest tessellation values) or segments are simplified. Tessellation is temporary.
-                targetLength: 0.01,
-                minCircle: 256,
-                maxCircle: 2048,
-                minArc: 200,
-                maxArc: 2048,
-                obround: 128,
-                adaptiveSegmentation: true,
-                minEndCap: 32,
-                maxEndCap: 256,
-                defaultMinSegments: 16,
-                defaultFallbackSegments: { min: 32, max: 128 }
-            },
-
-            tessellation: {
-                bezierSegments: 32,
-                minEllipticalSegments: 8
-            },
-
-            arcReconstruction: {
-                // REVIEW - Are these necessary? These may be pure truths that aren't meant to be reviewd themselves or edited in any capacity?
-                minArcPoints: 2,
-                maxGapPoints: 1,
-                minCirclePoints: 4
-            },
-
-            curveRegistry: {
-                hashPrecision: 1000
-            },
-
-            edgeKeyDecimals: 3
-        },
-
-        // ====================================================================
-        // FILE FORMAT SPECIFICATIONS
-        // ====================================================================
-        formats: {
-            excellon: {
-                defaultFormat: { integer: 2, decimal: 4 },
-                defaultUnits: 'mm',
-                defaultToolDiameter: 1.0,
-                minToolDiameter: 0.1,
-                maxToolDiameter: 10.0,
-                toolKeyPadding: 2
-            },
-            gerber: {
-                defaultFormat: { integer: 3, decimal: 3 },
-                defaultUnits: 'mm',
-                defaultAperture: 0.1,
-                minAperture: 0.01,
-                maxAperture: 10.0
-            },
-            svg: {
-                defaultStyles: {
-                    fill: 'black',
-                    fillOpacity: 1.0,
-                    stroke: 'none',
-                    strokeWidth: 1.0,
-                    strokeOpacity: 1.0,
-                    display: 'inline',
-                    visibility: 'visible'
-                }
-            }
-        },
-
-        // ====================================================================
-        // RENDERER ENGINE
-        // ====================================================================
-        renderer: {
-            context: {
-                alpha: false,
-                desynchronized: true
-            },
-            lodThreshold: 1,
-            zoom: {
-                fitPadding: 1.1,
-                fitPaddingWithOrigin: 1.35,
-                factor: 1.2,
-                min: 0.01,
-                max: 3000
-            },
-            emptyCanvas: {
-                originMarginLeft: 0.10,
-                originMarginBottom: 0.12,
-                defaultScale: 10
-            },
-            overlay: {
-                gridLineWidth: 0.1,
-                originStrokeWidth: 3,
-                originOutlineWidth: 1,
-                boundsLineWidth: 1,
-                boundsDash: [2, 2],
-                boundsMarkerSize: 5,
-                boundsMarkerWidth: 2,
-                rulerLineWidth: 1,
-                rulerFont: '11px Arial',
-                rulerCornerFont: '9px Arial',
-                rulerCornerText: 'mm',
-                rulerMinPixelStep: 50,
-                rulerAlpha: '99',
-                scaleIndicatorPadding: 10,
-                scaleIndicatorBarHeight: 4,
-                scaleIndicatorYOffset: 20,
-                scaleIndicatorTargetPixels: 100,
-                scaleIndicatorMinPixels: 50,
-                scaleIndicatorEndCapWidth: 2,
-                scaleIndicatorEndCapHeight: 4,
-                scaleIndicatorFont: '11px Arial',
-                statsX: 10,
-                statsY: 50,
-                statsLineHeight: 16,
-                statsBGWidth: 200,
-                statsFont: '12px monospace'
-            },
-            interaction: {
-                cursorGrabbing: 'grabbing',
-                cursorGrab: 'grab',
-                coordPrecision: 2,
-                zoomPrecision: 0
-            },
-            primitives: {
-                offsetStrokeWidth: 1,
-                centerMarkStrokeWidth: 3,
-                sourceDrillStrokeWidth: 3,
-                sourceDrillMarkSize: 0.2,
-                sourceDrillMarkRatio: 0.4,
-                peckMarkStrokeWidth: 3,
-                peckMarkMarkSize: 0.2,
-                peckMarkMarkRatio: 0.4,
-                peckMarkDash: [0.15, 0.15],
-                peckMarkRingFactor: 1.3,
-                peckMarkLabelOffset: 0.3,
-                reconstructedStrokeWidth: 2,
-                reconstructedCenterSize: 2,
-                reconstructedPathDash: [5, 5],
-                defaultStrokeWidth: 0.1,
-                debugPointSize: 4,
-                debugFont: '11px monospace',
-                debugLabelLineWidth: 2,
-                debugArcStrokeWidth: 3,
-                debugArcCenterSize: 4,
-                debugContourStrokeWidth: 2,
-                debugContourDash: [5, 5]
-            }
-        },
-
-        // ====================================================================
-        // STORAGE KEYS
-        // ====================================================================
-        storageKeys: {
-        // Shared across all apps on this domain
-        theme: 'cam-theme',
-        machine: 'cam-machine-settings',
-
-        // App-specific - call with app name from profile
-        // e.g. storageKeys.forApp('easyshape5000').parameters
-        forApp: function(appName) {
-            const prefix = appName.toLowerCase().replace(/[^a-z0-9]/g, '');
-            return {
-                settings: `${prefix}-settings`,
-                parameters: `${prefix}-parameters`,
-                pipeline: `${prefix}-pipeline`,
-                hideWelcome: `${prefix}-hide-welcome`
-            };
-        },
+  // ╔═══════════════════════════════════════════════════════════════════════╗
+  // ║ CONSTANTS                                                             ║
+  // ║ Frozen at runtime; never persisted, exported, or imported. Only       ║
+  // ║ values several modules or the worker must agree on, and tuning knobs. ║
+  // ║ A value that one file reads lives in that file.                       ║
+  // ╚═══════════════════════════════════════════════════════════════════════╝
+  constants: {
+    // ────────────────────────────────────────────────────────────────────
+    // PRECISION
+    // Canonical tolerance values. Every module references these instead of
+    // hardcoding numbers. When adding a new tolerance, check if an existing
+    // one already covers the use case before creating a new entry.
+    //
+    // ────────────────────────────────────────────────────────────────────
+    precision: {
+      epsilon: 1e-9, // Floating-point near-zero. Guard divisions, cross-product zero checks.
+      coordinate: 0.001, // Coordinate tolerance (mm): closer than this is the same point. Booleans quantize separately, at 1/clipper2scale.
+      rdpSimplification: 1e-4, // 2D polyline RDP tolerance.
+      scalarField: 1e-4 // Height/radius comparison threshold for Float32 terrain fields.
     },
+    // ────────────────────────────────────────────────────────────────────
+    // 4TH AXIS
+    // ────────────────────────────────────────────────────────────────────
+    rotary: {
+      // ── Generator tuning (read as constants.rotary) ──
+      edgeRunCells: 2, // Consecutive covered cells before a row's inward scan calls it the model edge. Rejects single-cell pinholes without trimming genuinely thin tips.
+      minRadiusClip: 0.01, // Smallest radius any radial target holds.
+      stubDefaultMm: 0.5, // Drive core radius when none is resolved.
+      autoLipFraction: 0.1, // Rollover lip depth as a fraction of tool diameter when the user leaves it at 0.
+      padSlackMm: 0.1, // Grid padding beyond the cutting reach.
+      indexClearance: 2,
+      // ── Slicer / chain post-filtering (ride genOptions) ──
+      minRadialitySin2: 0.05, // Reject faces within ~13° of axial (0 = off).
+      simplifyTolerance: 0.01,
+      minSegmentLength:  0.2,
+      // ── Export ──
+      // Fallback inverse-time (G93) ceiling for posts that don't declare
+      // their own. F = feed/length blows up on microscopic segments and
+      // hard-alarms most controllers above ~1e4.
+      maxInverseTime: 9999.99
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // V-Carving
+    // ────────────────────────────────────────────────────────────────────
+    vcarve: {
+      // Junction-fan prune floors, in multiples of sampleSpacing.
+      branchLengthFactor: 3,
+      branchDepthFactor: 1.5,
+      // Corner-hood gate: minimum SIGNED tangent-direction change across
+      // the corner window for a boundary vertex to be a corner. Signed,
+      // not per-vertex: 0.01mm tessellation on a 0.001mm coordinate grid
+      // carries ~5deg of direction noise per chord, so single vertices on
+      // a smooth wall clear any per-vertex threshold. Those spikes are
+      // zero-mean and cancel across the window; a real corner does not.
+      // Gates BOTH the resampler's keep decision and the spoke pass, which
+      // have to agree or a kept corner never ramps. Deliberately not the
+      // user's vcarveCornerAngle - that is contact separation for rib
+      // classification, a different quantity at a different stage.
+      resampleCornerAngle: 20,
+      // Max angle (deg) a circumcentre may sit off a corner's bisector
+      // and still be chosen as its spoke target.
+      cornerRayMaxAngle: 45,
+      // A vertex is a corner only when it owns this share of the ABSOLUTE
+      // turn inside the window. A tessellated curve spreads its turn over
+      // every sample in the window and fails; a corner concentrates it.
+      cornerTurnShare: .5,
+      // Corner window half-width, in multiples of sampleSpacing. THE knob
+      // for false spokes: too small and a coarsely tessellated curve reads
+      // as a run of corners, too large and a sharp apex between tight
+      // fillets loses its ramp. Sweep this first.
+      cornerWindow: 3,
+      // Ring samples each way whose incident triangles are candidate spoke
+      // targets. The apex's own ear can land outside the part, leaving it
+      // with no candidate of its own.
+      spokeSearchSpan: 2,
+      // Circle fast path: max radial miss from the fitted circle as a
+      // fraction of its radius. This IS the aspect gate: peak deviation
+      // of a best-fit circle over an ellipse is (a - b)/2 at both axis
+      // ends, so a band of tau*R accepts exactly a/b <= (1+tau)/(1-tau).
+      // 0.02 => 1.041. Never floor this with sampleSpacing - that makes
+      // the test absolute and size-independent, and small ellipses then
+      // collapse to a single plunge while their larger twins do not.
+      circleTolerance: 0.02,
+      // Circumcentre ridge projection: max Newton-style steps onto the
+      // locus equidistant from the two nearest boundary SEGMENTS. This is
+      // a centring refinement only - clearance is exact wherever the point
+      // ends up, so an unconverged step under-cuts by a hair and can never
+      // gouge or step. 0 off.
+      ridgeMaxSteps: 6,
+      // Below this |n1 - n2| two contact normals are effectively parallel
+      // (both contacts on one wall): no ridge here. Used to SELECT the
+      // second contact, not to abort. ~20 deg apart.
+      ridgeMinSeparation: .35,
+      // Clearance grid cell, in multiples of sampleSpacing. Segments are
+      // ~sampleSpacing long, so 2 keeps most segments in one or two cells.
+      clearanceGridCell: 2,
+      // Light x/y-only Laplacian over chain interiors after chaining;
+      // t is re-queried from the relaxed positions afterwards.
+      clearanceSmoothPasses: 2
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // GEOMETRY ENGINE
+    // ────────────────────────────────────────────────────────────────────
+    geometry: {
+      segments: {
+        // Pipeline tessellation only (Clipper input + arc reconstruction).
+        // TODO(tessellation) - counts should follow feature size: only arcs
+        // that get reconstructed need this density, and everything else is
+        // simplified afterwards.
+        targetLength: 0.01,
+        minCircle: 256,
+        maxCircle: 2048,
+        minArc: 200,
+        maxArc: 2048,
+        minEndCap: 32,
+        maxEndCap: 256,
+        defaultMinSegments: 16,
+        defaultFallbackSegments: { min: 32, max: 128 }
+      }
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // RENDERER ENGINE
+    // ────────────────────────────────────────────────────────────────────
+    renderer: {
+      context: {
+        alpha: false,
+        desynchronized: true
+      },
+      lodThreshold: 1,
+      zoom: {
+        fitPadding: 1.1,
+        factor: 1.2,
+        min: 0.01,
+        max: 3000
+      },
+      emptyCanvas: {
+        originMarginLeft: 0.10,
+        originMarginBottom: 0.12,
+        defaultScale: 10
+      }
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // LANGUAGES
+    // ────────────────────────────────────────────────────────────────────
+    // Language packs offered to users, as locale -> name in that language,
+    // for the picker. Only listed locales are fetched, so each needs a
+    // language/<locale>.json. en stays: it is every pack's fallback.
+    languages: {
+      en: 'English',
+      pt: 'Português',
+      es: 'Español',
+      fr: 'Français',
+      de: 'Deutsch',
+      ar: 'العربية' // REVIEW - Double check if this is the correct language name translation - No RTL yet
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // POST-PROCESSOR SETUPS
+    // ────────────────────────────────────────────────────────────────────
+    // The shipped setups in  order Machine Settings lists them. The ids
+    // are stored in settings and no custom setup may reuse one.
+    setups: ['grbl', 'makera', 'grblhal', 'uccnc', 'marlin', 'mach3', 'linuxcnc', 'roland', 'fanuc', 'winpcnc'],
+    // ────────────────────────────────────────────────────────────────────
+    // G-CODE COMMENT TEXT
+    // ────────────────────────────────────────────────────────────────────
+    // What BasePostProcessor.transliterate spells out before the NFKD fold to
+    // printable ASCII, which drops anything without an ASCII decomposition.
+    // Comment text is English, so these arrive in names: a file, an operation,
+    // a tool.
+    commentTransliteration: {
+      '°': ' deg',
+      '‘': "'",
+      '’': "'",
+      '‚': "'",
+      '“': '"',
+      '”': '"',
+      '„': '"',
+      '–': '-',
+      '—': '-',
+      '−': '-',
+      '×': 'x',
+      '±': '+/-',
+      'µ': 'u',
+      'μ': 'u',
+      'ß': 'ss',
+      'æ': 'ae',
+      'Æ': 'AE',
+      'œ': 'oe',
+      'Œ': 'OE',
+      'ø': 'o',
+      'Ø': 'O',
+      'ł': 'l',
+      'Ł': 'L',
+      'đ': 'd',
+      'Đ': 'D',
+      'ð': 'd',
+      'Ð': 'D',
+      'þ': 'th',
+      'Þ': 'Th',
+      'ı': 'i',
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // LASER PROFILES
+    // ────────────────────────────────────────────────────────────────────
+    // The shipped profiles in order Machine Settings lists them. The ids
+    // are stored in settings and no custom profile may reuse one.
+    laserProfiles: ['generic', 'lasergrbl', 'xtoolstudio', 'lightburn', 'rdworks'],
+    // ────────────────────────────────────────────────────────────────────
+    // STORAGE KEYS
+    // ────────────────────────────────────────────────────────────────────
+    storageKeys: {
+      // Shared across all apps on this domain
+      theme: 'cam-theme',
+      language: 'cam-language',
+      // Custom files, one key per entry: cam-custom:<kind>:<id> (core/custom-files.js)
+      custom: 'cam-custom',
+      // App-specific - call with app name from profile
+      // e.g. storageKeys.forApp('easyshape5000').settings
+      forApp: function(appName) {
+        const prefix = appName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return {
+          settings: `${prefix}-settings`,
+          hideWelcome: `${prefix}-hide-welcome`,
+        };
+      },
+    },
+  },
 
-        // ====================================================================
-        // UI SCHEMA
-        // Validation constraints, parameter option enums, category labels,
-        // icon mappings, static text. These define UI structure, not preferences.
-        // ====================================================================
-        ui: {
-            operationPanel: {
-                categories: {
-                    tool: 'Tool Selection',
-                    offset: 'Offset Generation',
-                    depth: 'Depth Settings',
-                    feeds: 'Feeds & Speeds',
-                    strategy: 'Cutting Strategy',
-                    drill: 'Peck Drill Parameters',
-                    cutout: 'Cutout Settings',
-                    stencil: 'Stencil Settings',
-                    machine: 'Machine Configuration',
-                    general: 'General Settings',
-                    laser_tool: 'Laser Tool',
-                    laser_geometry: 'Isolation',
-                    laser_strategy: 'Clearing Strategy',
-                    laser_cutout: 'Cut Settings',
-                    laser_export: 'Export Settings'
-                },
-                textAreaStyle: {
-                    fontFamily: 'monospace',
-                    fontSize: '11px'
-                }
-            },
 
-            text: {
-                noToolsAvailable: 'No tools available',
-                gcodePlaceholder: 'Click "Calculate Toolpaths" to generate G-code',
-                gcodeNoExportAlert: 'No G-code to export',
-                statusReady: 'Ready - Add PCB files to begin - Click here to expand log',
-                statusLoading: 'Loading...',
-                statusProcessing: 'Processing...',
-                statusSuccess: 'Operation completed successfully',
-                statusError: 'An error occurred',
-                statusWarning: 'Warning',
-                logHintViz: 'Toggle verbose debug messages in the Viz Panel.'
-            }
+  // ╔────────────────────────────────────────────────────────────────────═══════╗
+  // ║ DEFAULTS                                                              ║
+  // ║ Factory-reset values for all user-facing settings.                    ║
+  // ║ CamCore.loadSettings deep-clones them at startup and merges the saved ║
+  // ║ settings over the clone. A bad value here produces suboptimal but     ║
+  // ║ recoverable results - it never crashes the engine.                    ║
+  // ╚────────────────────────────────────────────────────────────────────═══════╝
+  defaults: {
+    pipeline: { machineClass: 'router', classByType: null },
+    // ────────────────────────────────────────────────────────────────────
+    // WORKERS
+    // ────────────────────────────────────────────────────────────────────
+    // Field worker pool size. Clamped to hardwareConcurrency - 1 at spawn
+    // (FieldWorkerClient._poolSize), so this is a ceiling, not a demand.
+    // Each worker importScripts the whole geometry stack, so it is a
+    // memory/throughput trade:
+    //  vcarve - ONE JOB PER SHAPE; scales with pool size. A 200-glyph
+    //  relief - one job total. Never uses more than one worker.
+    //  rotary - one job total. Never uses more than one worker.
+    // 0 = auto (hardwareConcurrency - 1, capped). Set a positive value only
+    // to define a static pool for debugging or when memory-constrained.
+    fieldWorkerPool: 0,
+    // ────────────────────────────────────────────────────────────────────
+    // MACHINE
+    // ────────────────────────────────────────────────────────────────────
+    // Namespace roots for per-device settings. Filled by loadSettings from
+    // each registered post-processor and laser profile - the device owns
+    // its own settings, so adding one must not need an edit here. The empty
+    // objects are the roots setSetting writes into.
+    processorSettings: {},
+    laserSettings: {},
+    // ────────────────────────────────────────────────────────────────────
+    // 4TH AXIS
+    // ────────────────────────────────────────────────────────────────────
+    rotary: {
+      // Where a mesh sits along the rotary axis in the radial scene until
+      // its Chuck or Center button says otherwise, and where Reset returns
+      // it: 'chuck' puts the end the chuck holds on the origin, 'center'
+      // its middle, 'file' keeps the file's own axial coordinate. Its
+      // cross-section is always centred on the axis. A build-time choice:
+      // neither the interface nor a custom file sets it.
+      placement: 'file'
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // G-CODE GENERATION
+    // ────────────────────────────────────────────────────────────────────
+    gcode: {
+      optimization: {
+        // Or-opt relocation refinement (refinePlanOrder /
+        // refineRegionOrder). routeCost is O(blocks), so a pass is
+        // O(blocks^3) - the budget is what bounds it, and the block
+        // count is only a sanity ceiling. Over budget the greedy NN
+        // order stands for whatever was not reached; it is correct,
+        // just not polished, and the optimizer says so in its log.
+        orOptMaxBlocks: 20000,
+        orOptBudgetMs: 250
+      }
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // LASER PIPELINE
+    // ────────────────────────────────────────────────────────────────────
+    // Root only: laser.* machine settings come from machineParameters, and
+    // per-type laser defaults from each operation's profile entry.
+    laser: {},
+    // ────────────────────────────────────────────────────────────────────
+    // GEOMETRY PROCESSING
+    // ────────────────────────────────────────────────────────────────────
+    geometry: {
+      decimals: {
+        coordinates: 3
+      }
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // TOOLPATH GENERATION
+    // ────────────────────────────────────────────────────────────────────
+    toolpath: {
+      generation: {
+        entry: {
+          helix: {
+            radiusFactor: 0.4,
+            pitch: 0.5,
+            segmentsPerRevolution: 16
+          },
+          ramp: {
+            defaultAngle: 10,
+            shallowDepthFactor: 0.1
+          }
+        },
+        // Only the commented-out helix constants lack readers. Kept so they are not re-invented as literals later.
+        drilling: {
+          peckRapidClearance: 0.1,
+          // helixPitchFactor: 0.5,
+          // helixMaxDepthFactor: 3.0,
+          // helixSegmentsPerRev: 16,
+          // slotHelixSegments: 12,
+          // slotHelixMaxPitchFactor: 0.5,
+          minHelixDiameter: 0.1,
+          millMargin: 0.05, // Hole minus cutter below which milling a ring is not worth it and the feature is pecked at centre instead.
+          matchTolerance: 0.02 // |bit - hole| within which auto-match calls a library drill an exact fit for that hole.
+        },
+        rapidCost: {
+          // Flat surcharge on every rapid link. Constant across
+          // candidates, so it never changes the nearest-neighbour
+          // choice - what it does is make any staydown or 3D
+          // continuation link out-bid a rapid of any length.
+          baseCost: 10000
+        },
+        simplification: {
+          curveToleranceFallback: 0.001,
+          straightToleranceFallback: 0.005,
+          straightAngleThreshold: 1.0,
+          sharpAngleThreshold: 10.0,
+          sharpCornerTolerance: 0.00001,
+          // ── 3D chains (V-Carve skeletons, relief rasters) ──
+          // tolerance3D - max 3D deviation the RDP pass may introduce.
+          tolerance3D: 0.01,
+          // minSegmentLength3D + collinearAngle3D - drive a cheap O(n)
+          //  pre-pass that removes Voronoi micro-segments BEFORE RDP.
+          //  A point is collapsed only when its incoming segment is
+          //  shorter than minSegmentLength3D OR the turn is under
+          //  collinearAngle3D, AND the resulting deviation stays under
+          //  tolerance3D * preTolFactor. Total error is therefore
+          //  bounded by tolerance3D * (1 + preTolFactor).
+          minSegmentLength3D: 0.02,
+          collinearAngle3D: 1.0,
+          preTolFactor: 0.25
+        },
+        // Single source of truth for the 3D toolpath layer.
+        threeD: {
+          // Descents steeper than this angle from horizontal use
+          // plungeRate instead of feedRate. 45deg => |dz| > dxy.
+          descentFeedAngleDeg: 60,
+          // Retract only to feedHeight between chains of the same
+          // operation (nothing protrudes above stock top).
+          allowHop: true,
+          // Entry-depth penalty for 3D chains: mm of rapid travel
+          // charged per mm of depth at the approach end. A chain
+          // entered at its deep end either plunges into stock or
+          // climbs out of a junction, so it should be picked only
+          // when the travel saved is worth more than that. It biases,
+          // it does not forbid - by the time a deep-entry chain is
+          // the cheapest option left, its neighbours have usually
+          // already opened that junction. 0 = pure distance.
+          entryDepthCost: 10
         }
+      },
+      tabs: {
+        minTabLength: 5
+      }
     },
-
-
-    // ╔═══════════════════════════════════════════════════════════════════════╗
-    // ║  DEFAULTS                                                             ║
-    // ║  Factory-reset values for all user-facing settings. SettingsManager   ║
-    // ║  deep-clones this on startup, then merges localStorage and any        ║
-    // ║  imported JSON over the clone. A bad value here produces suboptimal   ║
-    // ║  but recoverable results - it never crashes the engine.               ║
-    // ╚═══════════════════════════════════════════════════════════════════════╝
-    defaults: {
-
-
-        // ====================================================================
-        // MACHINE
-        // ====================================================================
-        machine: {
-            pcb: {
-                thickness: 1.6,
-                copperThickness: 0.035,
-                minFeatureSize: 0.1
-            },
-            heights: {
-                safeZ: 5.0,
-                travelZ: 2.0,
-                feedHeight: 1.0,    // Clearance above Z0 where G0→G1 handoff occurs.
-                maxSafeDepth: -10.1, // Negative Z limit. Calculated values below this throw an error.
-                // REVIEW - probeZ and homeZ may be mislabeled? Or just useless?
-                probeZ: -5.0,
-                homeZ: 10.0
-            },
-            speeds: {
-                rapidFeed: 1000,
-                probeFeed: 25,
-                maxFeed: 2000,
-                maxAcceleration: 100
-            },
-            // REVIEW - There is currently no workspace validation
-            // workspace: {
-            //     system: 'G54',
-            //     maxX: 200,
-            //     maxY: 200,
-            //     maxZ: 50,
-            //     minX: 0,
-            //     minY: 0,
-            //     minZ: -5
-            // },
-            coolant: 'none',
-            vacuum: false
-        },
-
-        // ====================================================================
-        // G-CODE GENERATION
-        // ====================================================================
-        gcode: {
-            postProcessor: 'grbl',
-            units: 'mm',
-
-            decimals: {
-                coordinates: 3,
-                feedrate: 0,
-                spindle: 0,
-                arc: 3
-            },
-
-            enableOptimization: true,
-
-            // REVIEW - How many are disconnected? How many should be connected?
-            optimization: {
-                enableGrouping: true,
-                pathOrdering: true,
-                segmentSimplification: true,
-                leadInOut: true,
-                rapidStrategy: 'adaptive',
-                shortTravelThreshold: 5.0,
-                reducedClearance: 1.0,
-                angleTolerance: 0.1,
-                minSegmentLength: 0.01,
-                planSamplePoints: 20
-            }
-        },
-
-        // ====================================================================
-        // LASER PIPELINE
-        // ====================================================================
-        laser: {
-        // Global Machine & Pipeline Settings
-            spotSize: 0.02,
-            exportFormat: 'svg',
-            exportDPI: 1000,
-            exportPadding: 5.0,
-            defaultClearStrategy: 'offset',
-
-            svgGrouping: 'none',
-            reverseCutOrder: false,
-            heatManagement: 'standard',
-            colorPerPass: false,
-
-            // Active profile key - drives structural SVG decisions
-            // REVIEW - isn't this pulled from profile.json?
-            activeProfile: 'generic',
-
-            // Profile definitions - each represents a laser control software target
-            // REVIEW - Is it worth splitting these like "post-processors"? Maybe adding them to the profile-trace.json?
-            profiles: {
-                generic: {
-                    label: 'Generic (Very Experimental)',
-                    svgGrouping: 'layer',
-                    reverseCutOrder: false,
-                    heatManagement: 'standard', // Sort primitives smallest-first within each pass
-                    colorPerPass: false, // Assign unique hue-rotated color per pass for color-mapped layers
-                    layerColors: {
-                        isolation: '#ff0000',
-                        drill:     '#0000ff',
-                        clearing:  '#00ff00',
-                        cutout:    '#000000',
-                        stencil:   '#860694'
-                    }
-                },
-                lasergrbl: {
-                    label: 'LaserGRBL (Very Experimental)',
-                    svgGrouping: 'group',        // Standard SVG groups; LaserGRBL imports grouped geometry as separate operations
-                    reverseCutOrder: false,
-                    heatManagement: 'standard',
-                    colorPerPass: false,
-                    layerColors: {
-                        isolation: '#ff0000',
-                        drill:     '#0000ff',
-                        clearing:  '#00ff00',
-                        cutout:    '#000000',
-                        stencil:   '#860694'
-                    }
-                },
-                xToolStudio: {
-                    label: 'xTool Studio (Less Experimental)',
-                    svgGrouping: 'color',
-                    reverseCutOrder: true,
-                    heatManagement: 'standard',
-                    colorPerPass: true,
-                    paletteLumping: true,
-                    // The exact 16 colors xCS maps to layers, ordered from Smallest/Delicate to Largest/Lumped
-                    palette: [
-                        '#EB3DBA', '#FE0002', '#FF7F56', '#E1C000', '#C29900', 
-                        '#96D71D', '#00C715', '#00897B', '#2366FF', '#00BEFE', 
-                        '#8170EF', '#A958FF', '#582FA8', '#D9D9D9', '#848B96',
-                        '#000000'
-                    ],
-                    layerColors: {
-                        isolation: '#FE0002',
-                        drill:     '#2366FF',
-                        clearing:  '#FE0002',
-                        cutout:    '#2366FF',
-                        stencil:   '#582FA8'
-                    }
-                },
-                lightburn: {
-                    label: 'LightBurn (Very Experimental)',
-                    svgGrouping: 'none',           // LightBurn prefers flat geometry; it builds its own layer tree from colors
-                    reverseCutOrder: true,         // LightBurn reads SVG bottom-to-top; reverse so first-in-file = first-cut
-                    heatManagement: 'standard',    // Sort primitives smallest-first within each pass
-                    colorPerPass: true,            // Assign unique hue-rotated color per pass
-                    layerColors: {
-                        isolation: '#ff0000',
-                        drill:     '#0000ff',
-                        clearing:  '#00ff00',
-                        cutout:    '#000000',
-                        stencil:   '#860694'
-                    }
-                },
-                rdworks: {
-                    label: 'RDWorks / Ruida (Very Experimental)',
-                    svgGrouping: 'layer',          // RDWorks maps Inkscape layers to its own laser layers
-                    reverseCutOrder: false,        // RDWorks processes layers top-to-bottom (standard DOM order)
-                    heatManagement: 'off',         // RDWorks handles its own optimization internally
-                    colorPerPass: false,           // Single color per layer; RDWorks assigns power/speed per layer, not per color // REVIEW - add a color per layer toggle?
-                    layerColors: {
-                        isolation: '#ff0000',
-                        drill:     '#00ff00',
-                        clearing:  '#0000ff',
-                        cutout:    '#000000',
-                        stencil:   '#ff00ff'
-                    }
-                }
-            },
-
-            // Runtime layer colors - synced from active profile on selection. // REVIEW - Should hatch have it's own dedicated color hardcoded here too?
-            layerColors: {
-                isolation: '#ff0000',
-                drill:     '#0000ff',
-                clearing:  '#00ff00',
-                cutout:    '#000000',
-                stencil:   '#860694'
-            },
-
-            // Operation-Specific Overrides
-            operations: {
-                isolation: { laserIsolationWidth: 0.4, laserStepOver: 10, laserClearStrategy: 'offset', laserHatchAngle: 0 },
-                clearing: { laserClearingPadding: 1.0, laserStepOver: 10, laserClearStrategy: 'offset', laserHatchAngle: 0 },
-                cutout: { laserCutSide: 'outside' },
-                drill:  { laserCutSide: 'inside' }
-            }
-        },
-
-        // ====================================================================
-        // GEOMETRY PROCESSING
-        // Tunable parameters affecting output quality, not correctness.
-        // ====================================================================
-        geometry: {
-            offsetting: {
-                miterLimit: 2.0,
-                minRoundJointSegments: 2
-            },
-            fusion: {
-                preserveArcs: true
-            },
-            // REVIEW - Dead code? Regions are handled automatically or worst case scenario the user is prompted
-            implicitRegionClosure: {
-                enabled: true,
-                cutoutOnly: true,
-                warnOnFailure: true
-            },
-            // REVIEW - Analytic offsetting values? Can be disabled?
-            selfIntersection: {
-                enabled: true,
-                gridCellFactor: 4,
-                endpointExclusion: 1e-6,
-                spatialDedup: 0.0001,
-                minLoopArea: 1e-6,
-                maxPasses: 3
-            },
-            simplification: {
-                enabled: true
-            }
-        },
-
-        // ====================================================================
-        // TOOLPATH GENERATION
-        // ====================================================================
-        toolpath: {
-            generation: {
-                entry: {
-                    helix: {
-                        radiusFactor: 0.4,
-                        pitch: 0.5,
-                        segmentsPerRevolution: 16
-                    },
-                    // REVIEW - MachineProcessor tries to look up context.strategy.entryRampAngle? Disconnected for now anyway
-                    ramp: {
-                        defaultAngle: 10,
-                        shallowDepthFactor: 0.1
-                    }
-                },
-                drilling: {
-                    peckRapidClearance: 0.1,
-                    helixPitchFactor: 0.5,
-                    helixMaxDepthFactor: 3.0,
-                    helixSegmentsPerRev: 16,
-                    slotHelixSegments: 12,
-                    slotHelixMaxPitchFactor: 0.5,
-                    minHelixDiameter: 0.2,
-                    defaultStepOver: 40
-                },
-                rapidCost: {
-                    zTravelThreshold: 5.0,
-                    zCostFactor: 1.5,
-                    baseCost: 10000
-                },
-                simplification: {
-                    minArcLength: 0.01,
-                    curveToleranceFactor: 100.0,
-                    curveToleranceFallback: 0.0005,
-                    straightToleranceFactor: 10.0,
-                    straightToleranceFallback: 0.005,
-                    straightAngleThreshold: 1.0,
-                    sharpAngleThreshold: 10.0,
-                    sharpCornerTolerance: 0.00001,
-                    segmentThresholdFactor: 10.0,
-                    segmentThresholdFallback: 0.5
-                }
-            },
-            tabs: {
-                cornerMarginFactor: 2.0,
-                minCornerAngle: 30,
-                minTabLength: 5
-            }
-        },
-
-        // ====================================================================
-        // EXPORT
-        // ====================================================================
-        export: {
-            defaultBaseName: 'pcb-output',
-            svg: {
-                padding: 5,
-                includeMetadata: true,
-                useViewBox: true,
-                embedStyles: true,
-                styles: {
-                    wireframeStrokeWidth: 0.05,
-                    cutoutStrokeWidth: 0.1
-                }
-            }
-        },
-
-        // ====================================================================
-        // UI LAYOUT
-        // ====================================================================
-        // REVIEW - Possibly disconnected dead code, consider if worth connecting or letting CSS do it's thing, could be relevant if users are allowed to move it in the future
-        layout: {
-            sidebarLeftWidth: 320,
-            sidebarRightWidth: 380,
-            statusBarHeight: 32,
-            sectionHeaderHeight: 36,
-            ui: {
-                autoTransition: true,
-                transitionDelay: 125
-            }
-        },
-
-        // ====================================================================
-        // RENDERING PREFERENCES
-        // ====================================================================
-        rendering: {
-            defaultOptions: {
-                showWireframe: false,
-                showPads: true,
-                blackAndWhite: false,
-                showGrid: true,
-                showOrigin: true,
-                showBounds: false,
-                showRulers: true,
-                fuseGeometry: false,
-                showRegions: true,
-                showTraces: true,
-                showDrills: true,
-                showCutouts: true,
-                showHoles: true,
-                holeRenderMode: 'proper',
-                debugHoleWinding: false,
-                showStats: false,
-                debugPoints: false,
-                debugArcs: false,
-                showOffsets: true,
-                showPreviews: true,
-                showPreprocessed: false,
-                showPreprocessedOffsets: false,
-                enableArcReconstruction: false,
-                showDebugInLog: false
-            },
-            canvas: {
-                defaultZoom: 10,
-                zoomStep: 1.2,
-                panSensitivity: 1.0,
-                wheelZoomSpeed: 0.002,
-                rulerSize: 20,
-                rulerTickLength: 5,
-                originMarkerSize: 10,
-                originCircleSize: 3,
-                wireframe: {
-                    baseThickness: 0.08,
-                    minThickness: 0.02,
-                    maxThickness: 0.2
-                }
-            },
-            grid: {
-                enabled: true,
-                minPixelSpacing: 40,
-                steps: [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
-            }
-        },
-
-        // ====================================================================
-        // UI PREFERENCES
-        // ====================================================================
-        ui: {
-            theme: 'dark',
-
-            timing: {
-                statusMessageDuration: 5000,
-                modalAnimationDuration: 300,
-                inputDebounceDelay: 300,
-                renderThrottle: 16,
-                propertyDebounce: 500
-            },
-
-            tooltips: {
-                enabled: true,
-                positionPadding: 8,
-                delayShow: 300,
-                delayHide: 150
-            },
-
-            visualization: {
-                geometryStageTransition: {
-                    enabled: true,
-                    duration: 300
-                }
-            }
-        },
-
-        // ====================================================================
-        // DEBUG & DEVELOPMENT
-        // ====================================================================
-        debug: {
-            enabled: false,
-            // REVIEW - Many are disconnected? Worth connecting?
-            logging: {
-                wasmOperations: false,
-                coordinateConversion: false,
-                polarityHandling: false,
-                parseOperations: false,
-                renderOperations: false,
-                fusionOperations: true,
-                fileOperations: false,
-                toolpathGeneration: false,
-                curveRegistration: true,
-                operations: false,
-                toolpaths: false,
-                rendering: false,
-                interactions: false,
-                cache: false
-            },
-            visualization: {
-                showBounds: false,
-                showStats: false,
-                showCoordinates: false,
-                // REVIEW - Disconnected? Worth connecting?
-                showPrimitiveIndices: false,
-                showWindingDirection: false,
-                highlightHoles: false,
-                showToolpathNodes: false,
-                highlightOffsetSegments: false,
-                showJoinTypes: false
-            },
-            validation: {
-                validateGeometry: true,
-                validateCoordinates: true, // REVIEW - Dead code?
-                warnOnInvalidData: true,
-                // REVIEW - Disconnected? Worth connecting?
-                validatePolarity: true,
-                strictParsing: false
-            }
+    // ────────────────────────────────────────────────────────────────────
+    // EXPORT
+    // ────────────────────────────────────────────────────────────────────
+    export: {
+      svg: {padding: 5}
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // RENDERING PREFERENCES
+    // ────────────────────────────────────────────────────────────────────
+    rendering: {
+      defaultOptions: {
+        showWireframe: false,
+        showPads: true,
+        blackAndWhite: false,
+        showGrid: true,
+        showOrigin: true,
+        showBounds: false,
+        showRulers: true,
+        fuseGeometry: false,
+        showRegions: true,
+        showTraces: true,
+        showDrills: true,
+        showCutouts: true,
+        showStats: false,
+        debugPoints: false,
+        debugArcs: false,
+        showOffsets: true,
+        showPreviews: true,
+        showPreprocessed: false,
+        enableArcReconstruction: false
+      },
+      // 3D preview (renderer3d/*). Those modules are ESM and
+      // dynamically imported, so they read window.CAMConfig at module
+      // load with this value.
+      preview3D: {
+        // mm per chord when linearizing an arc command or wrapping a
+        // developed rotary segment. Preview fidelity and simulator
+        // timing only; the exported arc is never touched.
+        arcSegmentLength: 0.4,
+        // Max deviation from the true arc, mm. Baked line geometry
+        // cannot re-flatten on zoom the way ctx.arc() does, so this
+        // is what stops circles reading as polygons when zoomed in.
+        arcSagitta: 0.02,
+        // WebGPURenderer construction.
+        antialias: true,
+        forceWebGL: false, // Force Three's WebGL2 rendering pipeline instead of WebGPU
+        // Corner of the 3D view the orientation cue sits in; both false is bottom-left.
+        orientationCueRight: true,
+        orientationCueTop: true,
+        // Scene lighting and the flat scene's ground grid
+        keyIntensity: 1.4,
+        fillIntensity: 1.1,
+        gridSize: 400, // mm
+        gridDivisions: 40
+      },
+      canvas: {
+        defaultZoom: 10,
+        wheelZoomSpeed: 0.002,
+        rulerSize: 20,
+        rulerTickLength: 5,
+        originMarkerSize: 10,
+        originCircleSize: 3,
+        wireframe: {
+          baseThickness: 0.08,
+          minThickness: 0.02,
+          maxThickness: 0.2
         }
+      },
+      grid: {
+        enabled: true,
+        minPixelSpacing: 40,
+        steps: [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+      }
     },
-
-
-    // ╔═══════════════════════════════════════════════════════════════════════╗
-    // ║  HELPER METHODS                                                       ║
-    // ║  Use explicit CAMConfig reference instead of 'this' to prevent        ║
-    // ║  context loss if a module destructures the method off the object.     ║
-    // ╚═══════════════════════════════════════════════════════════════════════╝
-
-    // Currently empty
-
+    // ────────────────────────────────────────────────────────────────────
+    // UI PREFERENCES
+    // ────────────────────────────────────────────────────────────────────
+    ui: {
+      theme: 'dark',
+      // combo → action name. Handlers are registered in code; which key
+      // runs them is data. This is the VOCABULARY, not a per-app list:
+      // an entry whose action no app registers is skipped by applyTable,
+      // so a verb one app lacks costs nothing and arrives free the day
+      // it gains it. Only bindings unique to one app belong in a profile.
+      // REVIEW - This list seems a bit pointless? Can this be made more useful or should it be removed?
+      shortcuts: [
+        // View
+        { combo: "F2", action: "toggle3D" },
+        { combo: "f", action: "zoomFit" },
+        { combo: "Home", action: "zoomFit" },
+        { combo: "=", action: "zoomFit" },
+        { combo: "+", action: "zoomIn", shiftOptional: true },
+        { combo: "-", action: "zoomOut" },
+        { combo: "g", action: "toggleGrid" },
+        { combo: "w", action: "toggleWireframe" },
+        // Global
+        { combo: "Escape", action: "escape" },
+        { combo: "F1", action: "showHelp" },
+        { combo: "ctrl+alt+d", action: "toggleVerboseDebug", mod: true, alt:true, allowInModal:true },
+        { combo: "F6", action: "cycleFocusZone", shiftOptional: true },
+        // Editing
+        { combo: "ctrl+z", action: "undo", mod: true },
+        { combo: "ctrl+shift+z", action: "redo", mod: true },
+        { combo: "ctrl+y", action: "redo", mod: true },
+        { combo: "ctrl+g", action: "group", mod: true },
+        { combo: "ctrl+shift+g", action: "ungroup", mod: true },
+        { combo: "ctrl+a", action: "selectAll", mod: true },
+        // Destructive: the tree owns Delete for the focused node, so
+        // the global selection delete must stay out of it.
+        { combo: "Delete", action: "deleteSelection", allowInTree: false },
+        { combo: "Backspace", action: "deleteSelection", allowInTree: false },
+        // Files & origin
+        { combo: "i", action: "addFiles", allowInTree: false },
+        { combo: "b", action: "bottomLeftOrigin" },
+        { combo: "o", action: "offsetOrigin" },
+        { combo: "c", action: "centerOrigin" },
+        // Pan. shiftOptional because the handler reads e.shiftKey.
+        { combo: "ArrowLeft", action: "pan", args: [1, 0], allowInTree: false, shiftOptional: true },
+        { combo: "ArrowRight", action: "pan", args: [-1, 0], allowInTree: false, shiftOptional: true },
+        { combo: "ArrowUp", action: "pan", args: [0, 1], allowInTree: false, shiftOptional: true },
+        { combo: "ArrowDown", action: "pan", args: [0, -1], allowInTree: false, shiftOptional: true }
+      ],
+      timing: {
+        statusMessageDuration: 5000,
+        propertyDebounce: 500,
+        settleDelay: 2000, // ms after the load event before whenSettled tasks run
+        // Synchronous work a long task runs between yields, in ms: the
+        // overlay paints and Cancel is heard at least this often.
+        taskSlice: 250
+      },
+      tooltips: {
+        delayShow: 300,
+        delayHide: 150
+      },
+      logHistoryMax: 500
+    },
+    // ────────────────────────────────────────────────────────────────────
+    // DEBUG & DEVELOPMENT
+    // ────────────────────────────────────────────────────────────────────
+    debug: {
+      enabled: false
+    }
+  }
 };
 
 
-// ════════════════════════════════════════════════════════════════════════════
+// ────────────────────────────────────────────────────────────────────────────
 // RUNTIME FREEZE
-//
 // Deep-freeze the constants subtree. Accidental mutation throws in strict mode
-// and silently fails in sloppy mode. Defaults are left mutable because
-// SettingsManager clones and overrides them at startup.
-//
+// and silently fails in sloppy mode. Defaults stay mutable: the debug toggle
+// writes D.debug.enabled at runtime, and CamCore.loadSettings works on a clone.
 // Uses globalThis for cross-environment compatibility (browser + Node/test).
-// ════════════════════════════════════════════════════════════════════════════
+// ────────────────────────────────────────────────────────────────────────────
 (function deepFreeze(obj) {
-    Object.freeze(obj);
-    for (var i = 0, keys = Object.getOwnPropertyNames(obj); i < keys.length; i++) {
-        var value = obj[keys[i]];
-        if (value && typeof value === 'object' && !Object.isFrozen(value)) {
-            deepFreeze(value);
-        }
-    }
+  Object.freeze(obj);
+  for (var i = 0, keys = Object.getOwnPropertyNames(obj); i < keys.length; i++) {
+    var value = obj[keys[i]];
+    if (value && typeof value === 'object' && !Object.isFrozen(value)) deepFreeze(value);
+  }
 })((typeof globalThis !== 'undefined' ? globalThis : window).CAMConfig.constants);

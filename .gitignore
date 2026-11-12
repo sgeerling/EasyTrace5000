@@ -16,7 +16,7 @@ desktop.ini
 # Logs
 *.log
 
-# Dependencies (if you add any later)
+# Dependencies
 node_modules/
 
 # Temporary files
@@ -25,5 +25,15 @@ node_modules/
 /dist
 
 # Extras
-/extras
-/renderer/3d.pdf
+/extras/
+/geometry/geometry-offsetter-analytic.js
+/tests/
+file-bundle.js
+FILE_BUNDLE_easycam5000.txt
+context-gen.js
+PROJECT_CONTEXT_easycam5000.txt
+project.config.js
+/language/RTL.md
+
+# Notes
+WebGPU_device_loss.md

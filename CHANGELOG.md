@@ -1,8 +1,169 @@
 # Changelog
 
-All notable changes to the **EasyTrace5000** project will be documented in this file.
+All notable changes to the **EasyCAM5000** project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.7.0] - 2026-11-10
+
+### Added
+- **i18n Translations:** i18n sub-systems have been added which allow for UI text to be replaced. Console messages for debugging remains English only.
+- **i18n Comparator:** Small tool has been added to help with fixing existing language packs and making new ones. [Comparator's README](language/comparator/README.md)
+- **Custom Files:** It is now possible to drag'n'drop custom json files that can affect different systems. Custom Themes, Language packs, Machine Setups, Laser Profiles and Tool Libraries. [#28](https://github.com/RicardoJCMarques/EasyCAM5000/issues/28) Read more at [here](core/CUSTOM.md). Other means of adding custom files are planned.
+- **High-Contrast Themes:** New Themes were added to help satisfy WCAG 2.1 - 1.4.3 & 1.4.11. Plus a few more accessibility tweaks.
+- **Verbose Comments:** During export a new toggle allows adding some operational parameters to the header comments so they are easily readable in "old" job files.
+- **Rotation Cues:** A cube/cylinder helps keep track of orientation in space wherever the camera may be pointing. Plus some extra arrows for transform cues.
+- **Chuck/Tail Models:** The new models appear on rotary operations and help understanding machine vs object orientation.
+
+### Changed
+- **Rotary Scene:** Complete rework of the 4th axis interface with more predictable/familiar transforms instead of obscure automated selectors.
+- **Post-Processors:** They were split into main logic and controller/machine setup jsons. Logic files expand a base logic module with a handful of overrides while setups hold config flags and can be replaced on the fly.
+- **Welcome Modal:** Tweaks to fit Language and Theme selectors plus other custom file warnings.
+- **Multi-tool Drilling:** Stages needed a few tweaks. Probably not finished yet.
+
+### Fixed
+- **V-Carve Mirror:** Bottomed out regions show up with mirroring on now.
+
+### Known Problems
+- **2D Previews on Edge:** Some 2D preview geometry may render with artifacts in Edge. 3D and Chrome don't seem to be affected. (Firefox remains my recommendation.)
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+- **Reordering CNC Jobs:** Export Modal rework broke it so they are always set in the default order unless grouping by tool is selected (minimize tool changes).
+
+
+## [1.6.2] - 2026-10-10
+
+### Added
+- **.zip storage:** Generic storage allows bundling multiple files. Reading/decompressing/compressing isn't viable. [#11](https://github.com/RicardoJCMarques/EasyCAM5000/discussions/11)
+- **+1 STL Shapes:** When a file has more than one mesh, each will generate it's own geometry object. Generating multiple 3D operation bucket isn't recommended as previews will overlap.
+- **New Sponsor:** Added banners + hyperlinks to [Fab Academy @ Fab Lab Benfica](https://fablabbenfica.pt/fabacademyLisboa/).
+
+### Changed
+- **Copper Removal:** Basic simulation of material removal was extended to Copper Clearing operations.
+- **Export flow:** Export modal and back-end logic were tweaked to be more predictable.
+- **3D Rendering:** 3D pipeline was made more resilient while attempting to debug a WebGPU crash that turned out was Firefox Dev + Three.js specific. (Fixed by 158.0b3)
+- **Stock Margin/Origin:** Stock handling was tweaked/improved in preparation for future material removal simulation.
+- **RML Post-processor:** Big refactor of the main logic (remove machine step quantization), needs more testing in all Roland models.
+- **Bounding Boxes:** Unified primitive bb math code.
+- **Config.js** Audit and clean-up of unused/useless keys.
+- Minor tweaks and clean-up around the code.
+
+### Fixed
+- **2D Rendering:** It was being sneaky and staying active even while 3D rendering was happening in the forefront.
+- **Multi-Tool Drilling:** Drill/slot operations UI was reworked to fix tool number export order and other minor issues.
+- **Doc Figures:** A bug made most shapes inside embedded figures disappear. All should render as expected.
+- **Hatch Pattern:** The zig-zag order wasn't zig-zagging.
+- **Laser PNG:** PNG export in the laser pipeline is working again.
+- **Hide Welcome** The toggle wasn't saving between sessions.
+
+### Known Problems
+- **V-Carve Mirror:** Flatzones are getting discarded when mirroring is active, both cancel out the bug (180º flip).
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+- **Reordering CNC Jobs:** Export Modal rework broke it so they are always set in the default order unless grouping by tool is selected (minimize tool changes).
+
+
+## [1.6.1] - 2026-09-11
+
+### Added
+- **Copper Holes:** A hidden operation adds holes/slots to 3d rendered copper geometry on drill toolpath generation. Especially useful for oversized tools that eat away copper pads.
+- **EasyShape5000 Accessibility:** Initial draft ARIA implementation and keyboard navigation rework on EasyShape5000.
+- **Stock Margin:** New parameter for stock auto-fit that leaves a space around the bounding box. (May be expanded to automatic cutouts, maybe...)
+
+### Changed
+- **Documentation:** Updated a bit to account for all the recent additions like 3D operations.
+- **Keybard Shortcuts:** Upgraded keyboard shortcut handling between apps.
+- **Loading Apps:** Tweaks to improve loading speed and transitions, for example moving from 2D to 3D rendering.
+- **Laser Profiles .json:** Move towards custom Laser machine profiles.
+- **GitHub Stuff:** Reworked READMEs and TEMPLATES.
+- **ToolChanging Tweaks:** Minor rework of the back-end logic. Shouldn't break anything.
+
+### Fixed
+- **Pocket Nesting:** Hole/Island detection toggle wasn't getting enforced in Pockets so only the outer shell polygon was processed.
+- **3D Rendering + Transforms:** 3D rendering plays nicer with transforms now.
+- **2D Laser in 3D:** 3D Renderer deals with laser geometry better.
+
+### Known Problems
+- **2D Stock Margin:** 2D rendering doesn't know how to deal with stock margin.
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+
+
+## [1.6.0] - 2026-09-02
+
+### Added
+- **Hybrid Laser Pipeline:** The Fiber laser pipeline has been unlocked - copper isolation/clearing operations show laser parameters, drill/cutout show cnc parameters on the same job.
+- **3D Toolpath Preview:** Calculating toolpaths was spun-off the export modal into it's own phase/node that triggers the 3d rendering frustum. Changing between rendering system is possible (Icon or F2).
+- **CNC Stencils:** The stencil operation can generate g-code now for those aiming to mill their stencil stock. [#18](https://github.com/RicardoJCMarques/EasyCAM5000/discussions/18)
+- **Rounded Stencils:** Corner radius was added as a parameter for SVG stencil geometry so that it's easier to cut on vinyl/drag knife plotters.
+- **Internal Offset Optimizations:** Added a first draft of allowing all internal offsets to link directly and bypass retract/rapid/plunge movements. (Holes/nesting not yet supported.)
+
+### Changed
+- **Line Numbers:** Instead of being locked by the post-processor, all programs can carry line numbers now (selectable from Machine Settings). Post-processors can set different defaults. 
+
+### Fixed
+- **Rotary Coordinates:** 4th Axis geometry is now rendering properly centered on the set axis, touching the origin point in a predictable way.
+- **Profile Nesting:** Hole/island detection in EasyShape5000 was ignoring the toggle during geometry generation.
+- **SVG Parsing:** A full circle syntax wasn't getting recognized and could cause problems in drill operations.
+- **Parameter Structure:** Parameters are a bit less of a mess, improved hierarchy and styling.
+- **Theme System:** Color management wasn't working properly in the 3D rendering frustum.
+- **V-Carving:** Small disconnect between parameters and geometry.
+
+### Known Problems
+- **2D Laser in 3D:** 3D Renderer doesn't know how to draw laser geometry.
+- **3D Rendering + Transforms:** 3D Renderer doesn't like mirror/rotation, gcode should be fine.
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+
+
+## [1.5.0] - 2026-08-24
+
+### Added
+- **Tool Changing:** An initial draft that allows tool changing commands to be exported inside gcode programs was added throughout but it may have broken stuff. [#25](https://github.com/RicardoJCMarques/EasyCAM5000/issues/25) [#27](https://github.com/RicardoJCMarques/EasyCAM5000/issues/27)
+- **WinPC-NC Post:** A VERY experimental post-processor draft for WinPC-NC variants controllers has been added. Proceed with extreme caution.
+
+### Changed
+- **Tool Assignment:** Because of tool changing logic, assigning a single tool (or none) may look different.
+- **3D Toolpath Preview:** Toolpath previews have been temporarily disabled until they fit better in the work-flow.
+
+### Fixed
+- **V-Carving Operation:** Geometry generation and toolpath planning were greatly improved. Generation time is an order of magnitude faster. [#26](https://github.com/RicardoJCMarques/EasyCAM5000/issues/26)
+- **User Parameters:** Small bugs were causing big problems in EasyShape5000.
+- **Tooltip Inconsistencies:** Plus initial steps for multi-lingual.
+- **Theme Inconsistencies:** Plus initial steps for custom themes.
+
+### Known Problems
+- **Drill Size:** False alarms are triggering warnings that tool is too big to mill when it's not.
+- **Circle Stay-down:** Stay-down optimizations for full circles seems to be broken. May be related to rotate optimizations.
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+
+
+## [1.4.9] - 2026-08-09
+
+### Added
+- **3D Operations:** V-Carving and 3D Relief Maps (Flat and Cylindrical) have been added to EasyShape5000. Proceed with some caution.
+- **3D Rendering:** 3D Frustrum to preview 3D geometry in all it's splendor. The UI and keyboard shortcuts will be tweaked in the future.
+- **Engraving:** Just a simple, lossless, operation to turn svg geometry into toolpaths with EasyShape5000 (no fill option, yet but easy to add if requested as hatching patterns already exist for the laser pipeline).
+- **Fanuc Post:** A VERY experimental post-processor draft for Fanuc variants controllers has been added. Proceed with extreme caution.
+
+### Changed
+- **EasyCAM5000:** Renaming the main repository as EasyCAM5000, it holds the original [EasyTrace5000](https://cam.eltryus.design/easytrace5000/) and now [EasyShape5000](https://cam.eltryus.design/easyshape5000/). With more to come.
+- **3D Previews:** Toolpaths are now getting triggered before the old Calculate Toolpaths button in the export modal. But the new system needs fine tunning and tweaks to the workflow. (4th axis toolpaths are wack.)
+- **State Manager:** The Status Log Manager got upgraded to also handle overlay spinner heartbeat messages.
+- **Tool Library:** Upgraded with more options for new operations. Initial plumbing to allow custom tool files.
+
+### Fixed
+- **Excellon Parsing:** Small tweak for explicit format notation syntax. 
+- **Tab Cut Direction:** Fixed tab passes being exported with the opposite cut direction/winding of other passes.
+- **Gerber Arcs:** Some implicit arc syntax wasn't getting properly processed. [#24](https://github.com/RicardoJCMarques/EasyCAM5000/issues/24)
+
+### Planned
+- **3D Optimizations:** EVERYTHING needs optimization, especially Relief toolpaths. Warning that V-Carve geometry generation is quite slow.
+- **Documentation:** Is a bit outdated now and needs a refresh. Especially EasyShape5000 and 3D operations.
+- **Invert SVG:** Some fabrication files have the actual traces set as holes. A new flip toggle can be implemented.
+- **Non-Conductive Copper:** Extend either isolation or clearing ops to allow for the efficient removal of non conductive copper up the cutout edge.
+
+### Known Problems
+- **Circle Stay-down:** Stay-down optimizations for full circles seems to be broken. May be related to rotate optimizations.
+- **Mold Mode:** The inversion on 3D flat reliefs is sort of working but not in a usable way yet.
+- **Themes & Colors:** Most transparency was removed from all rendering layers which caused colors to shift. Some things may look a bit off in the near future. Some changes have already been implemented to fix consistency between EasyTrace5000 and EasyShape5000.
+
 
 ## [1.4.2] - 2026-07-01
 
@@ -50,14 +211,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 - **Improved Bezier Plotting:** Some CAD programs lazily export regular arcs and linear segments as beziers; sometimes these can be infered back instead of getting automatically tessellated (better quality offsets).
-- **Add OP Files:** The + buttons to manually add files, through the file explorer, to individual operation are working again. [#19](https://github.com/RicardoJCMarques/EasyTrace5000/issues/19)
-- **Laser Drilling:** Geometry is now correctly offset instead of generating a laser dot sized circle. [#20](https://github.com/RicardoJCMarques/EasyTrace5000/issues/20)
+- **Add OP Files:** The + buttons to manually add files, through the file explorer, to individual operation are working again. [#19](https://github.com/RicardoJCMarques/EasyCAM5000/issues/19)
+- **Laser Drilling:** Geometry is now correctly offset instead of generating a laser dot sized circle. [#20](https://github.com/RicardoJCMarques/EasyCAM5000/issues/20)
 
 ### Changed
 - **Huge Backend Refactor:** With EasyShape5000 sharing most foundational sub-systems, it was necessary to split unique code blocks from all the shared ones. There shouldn't be any major changes to UI flow in EasyTrace5000. Included some explicit UI warnings.
  **Coordinate Rework:** Coordinates and transforms are now stored in matrices and there's a new scene manager (mostly because of EasyShape5000).
  **Transform Inputs:** Rotation and Scale (EasyShape5000) are now absolute and will always and explicitly show the value from default instead of being relative and reset to 0 on Apply.
- - **SVG Icons:** All icons have been extracted and now live as individual .svg files that are bundled into a sprite with the [build-sprite.js](https://github.com/RicardoJCMarques/EasyTrace5000/blob/main/.github/scripts/build-sprite.js) script.
+ - **SVG Icons:** All icons have been extracted and now live as individual .svg files that are bundled into a sprite with the [build-sprite.js](https://github.com/RicardoJCMarques/EasyCAM5000/blob/main/.github/scripts/build-sprite.js) script.
 - **Clipper2 WASM Test Page:** Spun off the test page developed during initial testing of the WASM version of Clipper2. It's now a split repo at [Clipper2-WASM-Example](https://github.com/RicardoJCMarques/Clipper2-WASM-Example).
 
 ### Known Problems
@@ -70,7 +231,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [1.3.3] - 2026-05-15
 
 ### Fixed
-- **Overwriting Geometry:** If Offset/Preview geometry objects exist, they are now replaced when new objects are created with different parameters. [#17](https://github.com/RicardoJCMarques/EasyTrace5000/issues/17)
+- **Overwriting Geometry:** If Offset/Preview geometry objects exist, they are now replaced when new objects are created with different parameters. [#17](https://github.com/RicardoJCMarques/EasyCAM5000/issues/17)
 - **Operation Warnings:** Some warnings wouldn't reset and could stack on themselves inside the parameter panel.
 
 ### Added
@@ -86,12 +247,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [1.3.2] - 2026-05-01
 
 ### Fixed
-- **Geometry Transforms:** Rotation and mirroring won't break arc winding any more. [#15](https://github.com/RicardoJCMarques/EasyTrace5000/issues/15)
+- **Geometry Transforms:** Rotation and mirroring won't break arc winding any more. [#15](https://github.com/RicardoJCMarques/EasyCAM5000/issues/15)
 - **Drill Macros:** Hole and slot macros for drill operations are now mirroring agnostic and are hardcoded climb milling.
 - **Tab Generation:** Was reinforced to handle mirroring without breaking arc winding for toolpaths at tab depth.
-- **Visualization State:** Layer visibility is more persistant and won't reset/desync when geometry changes happen. [#14](https://github.com/RicardoJCMarques/EasyTrace5000/issues/14)
+- **Visualization State:** Layer visibility is more persistant and won't reset/desync when geometry changes happen. [#14](https://github.com/RicardoJCMarques/EasyCAM5000/issues/14)
 - **File Parsing:** Leading and Trailing zeros are recognized and handled correctly now. Arcs that share a center, winding and touch will be merged too.
-- **Gerber Parsing:** Oval/Obround and other complex flashed pad macro shapes are properly processed. [#16](https://github.com/RicardoJCMarques/EasyTrace5000/issues/16)
+- **Gerber Parsing:** Oval/Obround and other complex flashed pad macro shapes are properly processed. [#16](https://github.com/RicardoJCMarques/EasyCAM5000/issues/16)
 - **Excellon Parsing:** More encoding formats are now supported.
 - **Arc Rendering:** Small improvements during debug states.
 
@@ -324,7 +485,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Improved UI Responsivenes:** Made the UI values more flexible. Workspace should be more usable even with smaller screens. (Not aiming at narrow smartphones, yet)
 - **Fixed Marlin Post-processor:** Marlin has been flagged as Not supporting modal commands.
 - **Added ARIA Tags:** Initial implementation of Accessible Rich Internet Applications tag management.
-- **Fixed/Expanded Keyboard Shortcuts/Navigation:** See [Accessibility Documentation](docs/ACCESSIBILITY.md) for more details.
+- **Fixed/Expanded Keyboard Shortcuts/Navigation:** See [Accessibility Documentation](easytrace5000/doc/ACCESSIBILITY.md) for more details. (And more recently added for [EasyShape5000](easyshape5000/doc/ACCESSIBILITY.md)).
 - **Added Favicons**
 - **SEO Changes**
 

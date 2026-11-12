@@ -1,16 +1,31 @@
 {
-  "_projectInfo": {
-    "file": "light.json",
-    "description": "Light Theme",
-    "author": "Eltryus - Ricardo Marques",
-    "see": "https://github.com/RicardoJCMarques/EasyTrace5000",
-    "license": "AGPL-3.0-or-later",
-    "copyright": "Copyright (C) 2025-2026 Eltryus - Ricardo Marques"
-  },
-
-  "version": "0.9",
-  
+  "_readme": [
+    "Companion to dark.json. Like every theme it declares every key dark.json",
+    "declares - themes are never partial - and sync-theme.js refuses it if not.",
+    "A custom theme is held to the same rule: CustomFiles refuses one with a",
+    "key missing or extra.",
+    "",
+    "base: 'light' -> the loader emits data-theme-base=\"light\". CSS that must",
+    "branch on light vs dark (icon assets, image filters) keys off THAT, never",
+    "off data-theme, which carries the theme id and cannot be enumerated once",
+    "themes are user-supplied.",
+    "",
+    "Values are NOT a mechanical inversion of dark.json. Anything drawn over",
+    "the 2D canvas (render2d.background #cdcdcd) or the 3D viewport",
+    "(render3d.background #e8eaed) needs luminance well below the surface it",
+    "sits on, so saturated high-luminance hues from the dark palette (#00ffff,",
+    "#ffff00, #44ff88) are darkened here rather than copied."
+  ],
+  "meta": {"kind": "theme"},
   "id": "light",
+  "base": "light",
+  "description": "Default light theme.",
+  "author": "Eltryus - Ricardo Marques",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/RicardoJCMarques/EasyCAM5000",
+
+  "tokens": {},
+
   "colors": {
     "background": {
       "primary": "#ffffff",
@@ -23,7 +38,8 @@
       "primary": "#1a1a1a",
       "secondary": "#666666",
       "disabled": "#999999",
-      "hint": "#b0b0b0"
+      "hint": "#b0b0b0",
+      "onEmphasis": "#ffffff"
     },
     "border": {
       "primary": "#e0e0e0",
@@ -39,30 +55,60 @@
       "success": "#22c55e",
       "warning": "#f59e0b",
       "error": "#ef4444",
-      "info": "#06b6d4"
+      "info": "#06b6d4",
+      "scrim": "rgba(15, 15, 15, 0.45)",
+      "scrimStrong": "rgba(15, 15, 15, 0.65)"
     },
+
     "operations": {
       "isolation": "#cc6600",
       "drill": "#0066cc",
       "clearing": "#008844",
       "cutout": "#ff00ff",
       "stencil": "#90177d",
-      "toolpath": "#ff8844"
+      "toolpath": "#ff8844",
+      "profile": "#6dd3a0",
+      "pocket": "#5a8acf",
+      "engrave": "#c794d6",
+      "vcarve": "#e07a7a",
+      "relief": "#e0a97a",
+      "rotary": "#7ab8e0",
+      "pattern": "#a8b56d"
     },
-    "canvas": {
+
+    "render2d": {
       "background": "#cdcdcd",
       "grid": "#909090",
       "origin": "#909090",
       "originOutline": "#ffffff",
       "bounds": "#909090",
-      "ruler": "909090",
+      "ruler": "#909090",
       "rulerText": "#909090"
     },
+
+    "render3d": {
+      "background": "#e8eaed",
+      "sky": "#ffffff",
+      "ground": "#c9ced6",
+      "grid": "#c4c8cd",
+      "gridCenter": "#a8adb4",
+      "rapid": "#8b9199",
+      "cutShallow": "#0284c7",
+      "cutDeep": "#b45309",
+      "stock": "#cfbd93",
+      "surface": "#d6ccb4",
+      "tool": "#6b7280",
+      "axisX": "#dc2626",
+      "axisY": "#16a34a",
+      "axisZ": "#2563eb",
+      "workholding": "#6b7280"
+    },
+
     "geometry": {
       "source": {
         "isolation": "#ff9555",
         "drill": "#5588bb",
-        "clearing": "#44ff88",
+        "clearing": "#2eb872",
         "cutout": "#b0b0b0",
         "unassigned": "#228b9d",
         "stencil": "#90177d"
@@ -73,47 +119,52 @@
         "on": "#bcbc02"
       },
       "preview": "#0060dd",
-      "toolpath": "#00ffff",
-      "selection": "#00ffff",
+      "toolpath": "#0891b2",
+      "selection": "#0891b2",
       "laser": {
         "filled": "#0060dd"
       }
     },
-    
+
     "primitives": {
       "offsetInternal": "#00aa00",
       "offsetExternal": "#ff0000",
-      "peckMarkGood": "#16d329ff",
-      "peckMarkWarn": "#d2cb00ff",
+      "peckMarkGood": "#15a02a",
+      "peckMarkWarn": "#b38600",
       "peckMarkError": "#ff0000",
-      "peckMarkSlow": "#ff5e00ff",
-      "reconstructed": "#00ffff",
-      "reconstructedPath": "#ffff00",
-      "debugContourColors": ["#00ff00", "#ff0000", "#0000ff", "#ffff00", "#ff00ff", "#00ffff"],
-      "debugCurveColors": ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff", "#00ffff"],
-      "debugLabel": "#FFFFFF",
-      "debugLabelStroke": "#000000"
+      "peckMarkSlow": "#ff5e00",
+      "reconstructed": "#0891b2",
+      "reconstructedPath": "#7a6f00"
     },
+
     "debug": {
       "points": "#ff00ff",
-      "arcs": "#00ffff",
+      "arcs": "#0891b2",
       "wireframe": "#00aa00",
       "bounds": "#ff0000",
-      "preprocessed-stroke": "#00ffff",
-      "preprocessed-fill": "#0a3333"
+      "preprocessedStroke": "#0891b2",
+      "preprocessedFill": "#cfe9ec"
     },
-    "bw":{
+
+    "bw": {
       "black": "#000000",
       "white": "#ffffff"
     },
+
     "pipelines": {
       "cnc": "#cc6600",
-      "laser": "#9333ea"
+      "laser": "#9333ea",
+      "3d": "#0e7490"
     },
+
     "interaction": {
       "sponsorship": "#4f46e5",
-      "sponsorshipText": "#5b21b6",
-      "kofi": "#0d9488"
+      "kofi": "#0d9488",
+      "selectionStroke": "#0891b2",
+      "selectionFill": "#cffafe",
+      "marqueeStroke": "#2563eb",
+      "marqueeFill": "#dbeafe",
+      "groupBounds": "#0891b2"
     }
   }
 }

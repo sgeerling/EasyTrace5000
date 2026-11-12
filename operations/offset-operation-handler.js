@@ -3,838 +3,746 @@
  * @description Shared offset pipeline for all contour-based operations
  * @author      Eltryus - Ricardo Marques
  * @copyright   2025-2026 Eltryus - Ricardo Marques
- * @see         {@link https://github.com/RicardoJCMarques/EasyTrace5000}
+ * @see         {@link https://github.com/RicardoJCMarques/EasyCAM5000}
  *
  * SPDX-FileCopyrightText: 2025-2026 Eltryus - Ricardo Marques
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 (function() {
-    'use strict';
+  'use strict';
 
-    const PRECISION = window.CAMConfig.constants.precision.coordinate;
-    const maxPasses = 500; // Arbitrary - Change if needed
+  const ROOT = globalThis;
+  const PRECISION = ROOT.CAMConfig.constants.precision.coordinate;
+  const maxPasses = 500; // Arbitrary - Change if needed
+
+  /**
+   * Owns the full topology-aware offset pipeline (boolean unions,
+   * differences, arc reconstruction, simplification).
+   * Subclasses override hook methods for operation-specific behavior.
+   */
+  class OffsetOperationHandler extends BaseOperationHandler {
+    // HOOKS (override in subclasses)
 
     /**
-     * Owns the full topology-aware offset pipeline (boolean unions,
-     * differences, arc reconstruction, simplification).
-     * Subclasses override hook methods for operation-specific behavior.
+     * Which side of the geometry the tool runs on: 'outside', 'inside' or
+     * 'on'. One hook rather than two booleans, because two booleans can
+     * encode a state the parameter cannot - internal AND on-line - and an
+     * override that wants to pin a direction had to answer both questions
+     * consistently to do it.
+     * An operation type with no cutSide parameter never carries the key,
+     * so the default is the outside pass every such type wants.
      */
-    class OffsetOperationHandler extends BaseOperationHandler {
-
-        // HOOKS (override in subclasses)
-
-        /**
-         * Whether offsets grow inward (clearing) or outward (isolation).
-         * Base implementation respects settings.cutSide for cutout/drill compatibility.
-         */
-        isInternalOffset(operation, settings) {
-            return settings.cutSide === 'inside';
-        }
-
-        /**
-         * Whether tool follows the geometry line with zero offset.
-         */
-        isOnLine(operation, settings) {
-            return settings.cutSide === 'on';
-        }
-
-        /**
-         * Whether to skip a primitive during offset generation.
-         * Base skips drill holes/slots in CNC mode (laser processes everything).
-         */
-        shouldSkipPrimitive(primitive, settings) {
-            if (settings.clearStrategy !== undefined) return false;
-            return primitive.properties?.role === 'drill_hole' ||
-                   primitive.properties?.role === 'drill_slot';
-        }
-
-        /**
-         * Whether the pre-flight circle-collapse guard should run.
-         * The guard prevents internal offsets from collapsing small circular
-         * features (e.g. drill pads in EasyTrace copper layers). Pocket
-         * operations override to false because internal collapse IS the
-         * intended termination condition.
-         */
-        shouldGuardCircleCollapse() {
-            return true;
-        }
-
-        /**
-         * Whether this operation runs on copper layers, where stroke
-         * primitives (traces) must be expanded rather than boundary-offset.
-         * Isolation and clearing override to true.
-         */
-        // REVIEW - This partially broke some kinds of SVG geometry in EasyTrace5000
-        isCopperOperation() {
-            return false;
-        }
-
-        /**
-         * Returns the clearance zone for filled/hatch laser strategies.
-         * Override in TraceIsolationHandler and TraceClearingHandler.
-         */
-        async getClearanceZone(operation, settings) {
-            return null;
-        }
-
-        /**
-         * Counts open path primitives. Closed-only operations
-         * (profile, pocket) call this before offsetting. Analytic shapes
-         * (circle/rect/obround) are closed by definition.
-         */
-        countOpenPaths(operation) {
-            return (operation.primitives || []).filter(p => {
-                if (p.type === 'circle' || p.type === 'rectangle' || p.type === 'obround') return false;
-                return !GeometryUtils.isPrimitiveClosed(p, PRECISION);
-            }).length;
-        }
-
-        // ORCHESTRATION
-
-        /**
-         * Resolves contour topology before the offset pipeline.
-         *
-         * Tier 1 (always): Re-derives hole assignment within each compound
-         *   primitive by geometric containment. Fixes the winding-sign
-         *   fragility in plotRegion for even-parity transforms.
-         *
-         * Tier 2 (opt-in via mergeNesting:true): Detects containment among
-         *   separate primitives and merges outers with their holes into
-         *   compound PathPrimitives.
-         *
-         * @param {Array} primitives
-         * @param {Object} [options]
-         * @param {boolean} [options.mergeNesting=false] - Run inter-primitive merge
-         * @returns {Array} Primitives with corrected topology
-         */
-        resolveContourTopology(primitives, { mergeNesting = false } = {}) {
-            if (!primitives || primitives.length === 0) return primitives;
-
-            // Tier 1: intra-primitive compound resolution
-            let resolved = [];
-            let compoundsFixed = 0;
-
-            for (const prim of primitives) {
-                const result = GeometryUtils.resolveCompoundContours(prim);
-                if (result.length !== 1 || result[0] !== prim) compoundsFixed++;
-                resolved.push(...result);
-            }
-
-            if (compoundsFixed > 0) {
-                this.debug(`Tier 1: resolved ${compoundsFixed} compound primitive(s) by containment`);
-            }
-
-            // Tier 2: inter-primitive nesting merge
-            if (!mergeNesting || resolved.length < 2) return resolved;
-
-            // Build the loop set for topology analysis. Closed analytic shapes
-            // (circle / rectangle / obround) are converted to paths HERE so they
-            // participate in nesting detection - an SVG circle dropped inside a
-            // rectangle is the common EasyShape case. Anything without a usable
-            // closed contour (open strokes, drill points) is set aside and
-            // re-appended untouched.
-            //
-            // NOTE: the prior version filtered to type === 'path' FIRST and
-            // pushed every analytic shape into nonPaths, so the conversion that
-            // followed was dead code and the `length < 2` guard aborted the merge
-            // whenever the nested set was analytic. That silently disabled
-            // nesting detection for EasyShape while leaving EasyTrace cutout
-            // (its own classifyPrimitives path) unaffected.
-            const loops    = [];
-            const passthru = [];
-            const sourceOf = new Map(); // converted loop -> original primitive
-
-            for (const prim of resolved) {
-                let loop = prim;
-                if (prim.type !== 'path') {
-                    const path = GeometryUtils.primitiveToPath(prim);
-                    if (path) {
-                        path.properties = { ...prim.properties, ...path.properties };
-                        loop = path;
-                    }
-                }
-
-                if (loop && loop.type === 'path' && loop.contours?.length > 0) {
-                    // Explode every contour into its own single-contour loop.
-                    // classifyCutoutTopology only inspects contours[0], so a
-                    // compound path (outer + holes - re-fed from a previous
-                    // generation, or a native SVG compound path) would otherwise
-                    // hide its holes from the classifier and the merge would drop
-                    // them. Mirrors GeometryUtils.resolveCompoundContours.
-                    for (const contour of loop.contours) {
-                        const singleLoop = new PathPrimitive([contour], { ...loop.properties });
-                        loops.push(singleLoop);
-                        // Only genuinely single-contour inputs revert to their
-                        // original primitive (preserves analytic arcs). Exploded
-                        // compound pieces get NO sourceOf entry, so the merge's
-                        // `|| outer.loop` fallback keeps the exploded contour
-                        // instead of dragging the whole compound (hole included)
-                        // back in.
-                        if (loop.contours.length === 1) sourceOf.set(singleLoop, prim);
-                    }
-                } else {
-                    passthru.push(prim);
-                }
-            }
-
-            if (loops.length < 2) return resolved;
-
-            const topology = GeometryUtils.classifyCutoutTopology(loops);
-            if (!topology.some(t => t.isHole)) return resolved;
-
-            // Group holes under their parent outers. Standalone outers (no holes)
-            // are emitted as their ORIGINAL primitive so analytic arcs survive;
-            // only true compounds (outer + hole contours) must be polygonized
-            // into a PathPrimitive.
-            const outers = topology.filter(t => !t.isHole);
-            const holes  = topology.filter(t => t.isHole);
-            const merged = [];
-
-            for (const outer of outers) {
-                const children = holes.filter(h => h.parentIdx === outer.originalIdx);
-                if (children.length === 0) {
-                    merged.push(sourceOf.get(outer.loop) || outer.loop);
-                } else {
-                    const newContours = [outer.loop.contours[0]];
-                    for (const child of children) {
-                        newContours.push(child.loop.contours[0]);
-                    }
-                    merged.push(new PathPrimitive(newContours, {
-                        ...outer.loop.properties
-                    }));
-                }
-            }
-
-            // Orphan holes (no parent) - keep as their original primitive
-            for (const hole of holes) {
-                if (hole.parentIdx === null) merged.push(sourceOf.get(hole.loop) || hole.loop);
-            }
-
-            this.debug(`Tier 2: merged ${loops.length} loop(s) → ${merged.length} primitive(s)`);
-            return [...merged, ...passthru];
-        }
-
-        async orchestrateGeneration(operation, params, core, options = {}) {
-            // Wipe all previous generation state
-            core.resetOperationState(operation.id);
-
-            // Compile parameters
-            const opParams = core.compileOperationParams(operation, params);
-
-            if (opParams.isLaser) {
-                operation.clearancePolygon = null;
-                await this.generateLaserFills(operation, opParams);
-            } else {
-                await this.generateGeometry(operation, { ...params, ...opParams });
-            }
-
-            const total = operation.offsets?.reduce((s, o) => s + (o.primitives?.length || 0), 0) || 0;
-            const passCount = operation.offsets?.length || 0;
-
-            if (total === 0) {
-                return { success: false, message: 'No geometry generated - tool may be too large for features', status: 'warning' };
-            }
-
-            if (opParams.isLaser) {
-                const strategy = opParams.clearStrategy || 'offset';
-
-                // CORE handles its own state
-                operation.exportReady = true;
-                operation.exportMetadata = {
-                    generatedAt: Date.now(),
-                    sourceOffsets: operation.offsets?.length || 0,
-                    strategy: strategy
-                };
-                
-                return { success: true, message: `Generated ${total} laser path(s) [${strategy}]`, status: 'success' };
-            }
-
-            return { success: true, message: `Generated ${passCount} offset(s)`, status: 'success' };
-        }
-
-        /**
-         * Ensures every primitive in the operation has a dense sourceId.
-         * EasyShape stamps these upstream (OperationBucket.syncPrimitives).
-         * This is the universal fallback for EasyTrace and any pipeline
-         * that reaches generateGeometry without pre-stamped identity.
-         */
-        ensureSourceIds(primitives) {
-            if (!primitives || primitives.length === 0) return;
-
-            // Continue from the highest existing id so EasyShape's
-            // pre-stamped ids are never overwritten or duplicated.
-            let maxId = 0;
-            for (const prim of primitives) {
-                const id = prim.properties?.sourceId || 0;
-                if (id > maxId) maxId = id;
-            }
-
-            let stamped = 0;
-            for (const prim of primitives) {
-                if (prim.properties?.sourceId > 0) continue;
-                const id = ++maxId;
-                (prim.properties ||= {}).sourceId = id;
-                stamped++;
-            }
-
-            if (stamped > 0) {
-                this.debug(`ensureSourceIds: stamped ${stamped} primitive(s) (ids ${maxId - stamped + 1}..${maxId})`);
-            }
-        }
-
-        /**
-         * Pre-compute a centroid/bounds index from the operation's source
-         * primitives. Used by attributeShapeKey for fast spatial lookup.
-         */
-        buildSourceIndex(primitives) {
-            const index = [];
-            for (const prim of primitives) {
-                const id = prim.properties?.sourceId;
-                if (!id || id <= 0) continue;
-                const b = prim.getBounds();
-                if (!b) continue;
-                index.push({
-                    id,
-                    bounds: b,
-                    cx: (b.minX + b.maxX) / 2,
-                    cy: (b.minY + b.maxY) / 2
-                });
-            }
-            return index;
-        }
-
-        /**
-         * Geometric re-attribution: which source shape does this offset
-         * polygon belong to? Uses centroid proximity with a bounds-overlap
-         * prefilter. Works for internal offsets (output centroid is inside
-         * source), external offsets (output centroid is near source centroid),
-         * and merged unions (nearest source wins).
-         */
-        attributeShapeKey(poly, srcIndex) {
-            if (!srcIndex || srcIndex.length === 0) return -1;
-
-            // Circle primitives survive offset analytically
-            const pb = poly.getBounds ? poly.getBounds() : null;
-            if (!pb) return -1;
-
-            const cx = (pb.minX + pb.maxX) / 2;
-            const cy = (pb.minY + pb.maxY) / 2;
-
-            let bestId = -1;
-            let bestDistSq = Infinity;
-
-            for (const src of srcIndex) {
-                // Bounds overlap prefilter - fast reject
-                if (pb.maxX < src.bounds.minX || pb.minX > src.bounds.maxX ||
-                    pb.maxY < src.bounds.minY || pb.minY > src.bounds.maxY) continue;
-
-                const dx = cx - src.cx;
-                const dy = cy - src.cy;
-                const distSq = dx * dx + dy * dy;
-
-                if (distSq < bestDistSq) {
-                    bestDistSq = distSq;
-                    bestId = src.id;
-                }
-            }
-
-            return bestId;
-        }
-
-        preparePrimitivesForOffset(primitives) {
-            if (this.isCopperOperation()) return primitives; // preserve stroke metadata
-            return super.preparePrimitivesForOffset(primitives);
-        }
-
-        async offsetSinglePrimitive(primitive, distance) {
-            if (this.isCopperOperation()) {
-                const props = primitive.properties || {};
-                const isStroke = (props.stroke && !props.fill) || props.isTrace;
-                if (isStroke && props.strokeWidth > 0) {
-                    const combinedWidth = props.strokeWidth + distance * 2;
-                    return this.core.geometryOffsetter.expandStroke(primitive, combinedWidth);
-                }
-            }
-            return super.offsetSinglePrimitive(primitive, distance);
-        }
-
-        // MAIN OFFSET PIPELINE
-
-        async generateGeometry(operation, settings) {
-            // Clone to prevent mutating shared state
-            settings = { ...settings };
-
-            operation.debugStrokes = [];
-
-            this.debug('=== OFFSET PIPELINE START ===');
-            this.debug(`Operation: ${operation.id} (${operation.type})`);
-
-            await this.core.ensureProcessorReady();
-            if (!this.core.geometryOffsetter || !this.core.geometryProcessor) {
-                throw new Error('Geometry processors not initialized');
-            }
-            if (!operation.primitives || operation.primitives.length === 0) {
-                return [];
-            }
-
-            // Identity: stamp any untagged primitives and build spatial index
-            // for geometric shapeKey attribution after offset passes.
-            this.ensureSourceIds(operation.primitives);
-            const srcIndex = this.buildSourceIndex(operation.primitives);
-
-            // Determine offset direction via hooks
-            let isInternal = this.isInternalOffset(operation, settings);
-            let isOnLine = this.isOnLine(operation, settings);
-
-            // Offset distance parameters
-            let radius, sign, step;
-
-            if (isOnLine) {
-                // on-line: single pass at distance 0
-            } else {
-                radius = settings.toolDiameter / 2;
-                sign = isInternal ? -1 : 1;
-
-                // Resolve step distance
-                const stepOverPct = settings.stepOver !== undefined ? settings.stepOver : 100;
-                step = (settings.stepDistance && settings.stepDistance > 0)
-                    ? settings.stepDistance
-                    : settings.toolDiameter * (stepOverPct / 100.0);
-            }
-
-            // Distance generator: returns null when exhausted.
-            const getOffsetDistance = (passIndex) => {
-                if (isOnLine) return passIndex === 0 ? 0 : null;
-
-                // Laser: walk outward until targetWidth reached
-                if (settings.targetWidth !== null && settings.targetWidth > 0) {
-                    if (passIndex >= maxPasses) return null;
-                    const currentOffset = radius + (passIndex === 0 ? 0 : passIndex * step);
-                    if ((currentOffset + radius) > settings.targetWidth + PRECISION) return null;
-                    return sign * currentOffset;
-                }
-
-                // CNC: explicit pass count
-                const count = Math.min(settings.passes || 1, maxPasses);
-                if (passIndex >= count) return null;
-                return sign * (radius + (passIndex === 0 ? 0 : passIndex * step)); // REVIEW - Double check if these 0 value safeguard are needed to make sure step values aren't NaN
-            };
-
-            // Guard: prevent internal offsets from collapsing small circular features
-            let forceOnLine = false;
-            if (isInternal && !isOnLine && this.shouldGuardCircleCollapse()) {
-                const circles = operation.primitives.filter(p => p.type === 'circle' && p.radius);
-                if (circles.length > 0) {
-                    const smallestFeature = Math.min(...circles.map(p => p.radius * 2));
-                    const firstOffset = Math.abs(getOffsetDistance(0) || 0);
-                    if (smallestFeature > 0 && firstOffset >= smallestFeature / 2) {
-                        this.debug(`Internal offset ${firstOffset.toFixed(3)}mm would collapse features (smallest: ${smallestFeature.toFixed(3)}mm). Falling back to on-line.`);
-                        forceOnLine = true;
-                    }
-                }
-            }
-
-            // PRE-FUSION
-            let primitivesToProcess = this.preparePrimitivesForOffset(operation.primitives);
-
-            // TOPOLOGICAL CATEGORIZATION
-            const levelBuckets = [];
-            const complexRegions = [];
-            const simpleGeometry = [];
-
-            const isLaserPipeline = settings.clearStrategy !== undefined;
-
-            primitivesToProcess.forEach(prim => {
-                if (this.shouldSkipPrimitive(prim, settings)) return;
-
-                if (prim.properties?.isComposited) {
-                    if (prim.contours && prim.contours.length > 0) {
-                        prim.contours.forEach(contour => {
-                            const lvl = contour.nestingLevel || 0;
-                            if (!levelBuckets[lvl]) levelBuckets[lvl] = [];
-                            levelBuckets[lvl].push(new PathPrimitive([contour], { ...prim.properties }));
-                        });
-                    } else {
-                        if (!levelBuckets[0]) levelBuckets[0] = [];
-                        levelBuckets[0].push(prim);
-                    }
-                } else {
-                    const isTraceOrPad = prim.properties?.isTrace || prim.properties?.isPad ||
-                                         prim.properties?.isFlash || prim.properties?.stroke;
-
-                    if (prim.type === 'path' && prim.contours && prim.contours.length > 0 && !isTraceOrPad) {
-                        const hasHoles = prim.contours.some(c => c.isHole);
-                        if (hasHoles) {
-                            complexRegions.push(prim);
-                        } else {
-                            simpleGeometry.push(prim);
-                        }
-                    } else {
-                        simpleGeometry.push(prim);
-                    }
-                }
-            });
-
-            // PER-PASS OFFSET GENERATION
-            operation.offsets = [];
-            const passResults = [];
-
-            const processGroup = async (group, dist) => {
-                const promises = group.map(p => this.offsetSinglePrimitive(p, dist));
-                const results = await Promise.all(promises);
-                const out = [];
-                for (let gi = 0; gi < results.length; gi++) {
-                    const srcId = group[gi].properties?.sourceId ?? 0;   // carry source-shape identity
-                    const res = results[gi];
-                    const push = (r) => {
-                        if (!r) return;
-                        (r.properties ||= {}).sourceId = srcId;
-                        // Stamp every non-arc point so the Z channel carries identity through Clipper.
-                        if (srcId > 0 && r.contours) {
-                            for (const c of r.contours) {
-                                if (!c.points) continue;
-                                for (const pt of c.points) {
-                                    if (!pt.curveId || pt.curveId <= 0) pt.sourceId = srcId;
-                                }
-                            }
-                        }
-                        out.push(r);
-                    };
-                    if (Array.isArray(res)) res.forEach(push);
-                    else push(res);
-                }
-                return out;
-            };
-
-            // Cache DOM ref outside the hot loop
-            const progressEl = document.getElementById('canvas-loading-message');
-
-            let passIndex = 0;
-            while (true) {
-                const distance = forceOnLine
-                    ? (passIndex === 0 ? 0 : null)
-                    : getOffsetDistance(passIndex);
-
-                if (distance === null) break;
-                if (passIndex >= maxPasses) {
-                    console.warn(`[OffsetOperationHandler] Reached safeguard limit of ${maxPasses} passes. Halting.`);
-                    break;
-                }
-
-                if (passIndex > 0 && passIndex % 1 === 0) {
-                    if (progressEl) progressEl.textContent = `Generating... pass ${passIndex + 1}`;
-                    await new Promise(resolve => {
-                        const ch = new MessageChannel();
-                        ch.port1.onmessage = () => resolve();
-                        ch.port2.postMessage(null);
-                    })
-                }
-
-                const offsetType = distance >= 0 ? 'external' : 'internal';
-
-                this.debug(`--- PASS ${passIndex + 1}: ${distance.toFixed(3)}mm (${offsetType}) ---`);
-
-                let passGeometry = [];
-
-                if (levelBuckets.length > 0) {
-                    // Level-by-Level Recomposition (Like Eagle geometry)
-                    const offsetSimpleGeom = await processGroup(simpleGeometry, distance);
-
-                    for (let lvl = 0; lvl < levelBuckets.length; lvl++) {
-                        const bucket = levelBuckets[lvl];
-                        if (!bucket || bucket.length === 0) continue;
-
-                        const isHoleLevel = lvl % 2 === 1;
-                        const dist = isHoleLevel ? -distance : distance;
-                        const offsetBucket = await processGroup(bucket, dist);
-
-                        if (offsetBucket.length === 0) continue;
-
-                        if (lvl === 0) {
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(offsetBucket);
-                        } else if (isHoleLevel) {
-                            const holeUnion = await this.core.geometryProcessor.unionGeometry(offsetBucket);
-                            if (passGeometry.length > 0) {
-                                passGeometry = await this.core.geometryProcessor.difference(passGeometry, holeUnion);
-                            }
-                        } else {
-                            const islandUnion = await this.core.geometryProcessor.unionGeometry(offsetBucket);
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(passGeometry.concat(islandUnion));
-                        }
-                    }
-
-                    if (offsetSimpleGeom.length > 0) {
-                        if (passGeometry.length > 0) {
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(passGeometry.concat(offsetSimpleGeom));
-                        } else {
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(offsetSimpleGeom);
-                        }
-                    }
-                } else {
-                    // Per-Region Resolution (Like KiCAD geometry)
-                    const offsetSimpleGeom = await processGroup(simpleGeometry, distance);
-                    const resolvedOffsetRegions = [];
-
-                    for (const regionPrim of complexRegions) {
-                        const regionShells = [];
-                        const regionHoles = [];
-
-                        regionPrim.contours.forEach(contour => {
-                            const simplePrim = new PathPrimitive([contour], { ...regionPrim.properties });
-                            if (contour.isHole) regionHoles.push(simplePrim);
-                            else regionShells.push(simplePrim);
-                        });
-
-                        const offsetShells = await processGroup(regionShells, distance);
-                        const offsetHoles = await processGroup(regionHoles, -distance);
-
-                        let regionResult = [];
-                        if (offsetShells.length > 0) {
-                            const shellUnion = await this.core.geometryProcessor.unionGeometry(offsetShells);
-                            if (offsetHoles.length > 0) {
-                                const holeUnion = await this.core.geometryProcessor.unionGeometry(offsetHoles);
-                                regionResult = await this.core.geometryProcessor.difference(shellUnion, holeUnion);
-                            } else {
-                                regionResult = shellUnion;
-                            }
-                        }
-                        if (regionResult.length > 0) {
-                            resolvedOffsetRegions.push(...regionResult);
-                        }
-                    }
-
-                    if (resolvedOffsetRegions.length > 0) {
-                        if (offsetSimpleGeom.length > 0) {
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(resolvedOffsetRegions.concat(offsetSimpleGeom));
-                        } else {
-                            passGeometry = await this.core.geometryProcessor.unionGeometry(resolvedOffsetRegions);
-                        }
-                    } else if (offsetSimpleGeom.length > 0) {
-                        passGeometry = await this.core.geometryProcessor.unionGeometry(offsetSimpleGeom);
-                    }
-                }
-
-                // Early termination: geometry collapsed to nothing at this distance
-                if (passGeometry.length === 0) {
-                    this.debug(`Pass ${passIndex + 1}: geometry collapsed at ${distance.toFixed(3)}mm. Halting.`);
-                    break;
-                }
-
-                // POST-PROCESSING
-                if (!settings.skipArcReconstruction && Math.abs(distance) >= PRECISION) {
-                    passGeometry = this.core.geometryProcessor.arcReconstructor.processForReconstruction(passGeometry);
-                }
-                this.core.geometryOffsetter.simplifyOffsetResult(passGeometry, Math.abs(distance));
-
-                const thermalGroup = distance < 0 ? 'internal' : 'external';
-
-                const reconstructedGeometry = passGeometry.map(p => {
-                    if (!p.properties) p.properties = {};
-                    p.properties.isOffset = true;
-                    p.properties.pass = passIndex + 1;
-                    p.properties.offsetDistance = distance;
-                    p.properties.offsetType = offsetType;
-                    p.properties.thermalGroup = thermalGroup;
-                    p.properties.hasAnalyticArcs = (p.type === 'circle') || (p.contours?.some(c => c.arcSegments?.length > 0));
-                    p.properties.shapeKey = this.attributeShapeKey(p, srcIndex);   // identity surviving the boolean union
-                    return p;
-                });
-
-                passResults.push({
-                    distance: distance,
-                    actualDistance: distance,
-                    pass: passIndex + 1,
-                    offsetType: offsetType,
-                    thermalGroup: thermalGroup,
-                    primitives: reconstructedGeometry,
-                    metadata: {
-                        sourceCount: primitivesToProcess.length,
-                        finalCount: reconstructedGeometry.length,
-                        generatedAt: Date.now(),
-                        toolDiameter: settings.toolDiameter,
-                        targetWidth: settings.targetWidth || null,
-                        actualWidth: Math.abs(distance) + (settings.toolDiameter / 2),
-                        wasFused: primitivesToProcess !== operation.primitives,
-                        thermalGroup: thermalGroup
-                    }
-                });
-
-                passIndex++;
-            }
-
-            // Calculate actual width based on the last successful pass
-            const actualWidth = passResults.length > 0
-                ? Math.abs(passResults[passResults.length - 1].distance) + (settings.toolDiameter / 2)
-                : 0;
-
-            // COMBINE PASSES
-            if (settings.combineOffsets && passResults.length > 1) {
-                const allPassPrimitives = passResults.flatMap(p => p.primitives);
-                operation.offsets = [{
-                    id: `offset_combined_${operation.id}`,
-                    distance: passResults[0].distance,
-                    pass: 1,
-                    primitives: allPassPrimitives,
-                    type: 'offset',
-                    metadata: {
-                        sourceCount: primitivesToProcess.length,
-                        finalCount: allPassPrimitives.length,
-                        generatedAt: Date.now(),
-                        toolDiameter: settings.toolDiameter,
-                        targetWidth: settings.targetWidth || null,
-                        actualWidth: actualWidth,
-                        offset: {
-                            combined: true,
-                            passes: passResults.length,
-                            offsetCount: allPassPrimitives.length
-                        }
-                    },
-                    settings: { ...settings }
-                }];
-            } else {
-                operation.offsets = passResults.map((passResult, index) => ({
-                    id: `offset_${operation.id}_${index}`,
-                    ...passResult,
-                    settings: { ...settings }
-                }));
-            }
-
-            const totalPrimitives = operation.offsets.reduce((sum, o) => sum + o.primitives.length, 0);
-            this.debug(`Generated ${operation.offsets.length} offset group(s), ${totalPrimitives} total primitives.`);
-            this.debug(`=== OFFSET PIPELINE COMPLETE ===`);
-
-            return operation.offsets;
-        }
-
-        // LASER GEOMETRY
-
-        async generateLaserFills(operation, settings) {
-            this.debug(`=== LASER GEOMETRY GENERATION: ${settings.clearStrategy} ===`);
-
-            const strategy = settings.clearStrategy || 'offset';
-
-            if (strategy === 'offset') {
-                await this.generateGeometry(operation, settings);
-                return operation.offsets;
-            }
-
-            // Filled/hatch strategies need a clearance zone
-            let clearanceZone = operation.clearancePolygon;
-
-            if (!clearanceZone || clearanceZone.length === 0) {
-                clearanceZone = await this.getClearanceZone(operation, settings);
-            }
-
-            if (!clearanceZone || clearanceZone.length === 0) {
-                this.debug('Clearance zone empty, falling back to offset strategy');
-                await this.generateGeometry(operation, settings);
-                return operation.offsets;
-            }
-
-            switch (strategy) {
-                case 'filled': {
-                    let filledGeometry = clearanceZone;
-                    if (this.core.geometryProcessor?.arcReconstructor) {
-                        filledGeometry = this.core.geometryProcessor.arcReconstructor
-                            .processForReconstruction(clearanceZone);
-                        this.debug(`Filled: reconstructed ${clearanceZone.length} → ${filledGeometry.length} primitives`);
-                    }
-
-                    operation.offsets = [{
-                        distance: 0,
-                        pass: 1,
-                        type: 'filled',
-                        primitives: filledGeometry,
-                        metadata: {
-                            strategy: 'filled',
-                            isolationWidth: settings.isolationWidth || 0,
-                            isBoardClearing: settings.isBoardClearing || false,
-                            finalCount: filledGeometry.length
-                        }
-                    }];
-                    break;
-                }
-
-                case 'hatch': {
-                    if (typeof HatchGenerator !== 'undefined') {
-                        operation.offsets = HatchGenerator.generate(clearanceZone, settings);
-                        this.debug(`Hatch: generated ${operation.offsets.length} pass(es)`);
-                    } else {
-                        console.warn('[OffsetOperationHandler] HatchGenerator missing, falling back to offset.');
-                        await this.generateGeometry(operation, settings);
-                    }
-                    break;
-                }
-
-                default:
-                    this.debug(`Unknown laser strategy: ${strategy}, falling back to offset`);
-                    await this.generateGeometry(operation, settings);
-                    break;
-            }
-
-            return operation.offsets;
-        }
-
-        // CLEARANCE POLYGON (shared helper for filled/hatch)
-
-        async generateClearancePolygon(operation, isolationWidth) {
-            await this.core.ensureProcessorReady();
-
-            if (!operation.primitives || operation.primitives.length === 0) return [];
-
-            this.debug(`=== CLEARANCE POLYGON GENERATION: width=${isolationWidth.toFixed(3)}mm ===`);
-
-            const savedOffsets = operation.offsets;
-
-            try {
-                await this.generateGeometry(operation, {
-                    toolDiameter: isolationWidth * 2,
-                    passes: 1,
-                    stepOver: 0,
-                    combineOffsets: true,
-                    skipArcReconstruction: true
-                });
-
-                const expanded = operation.offsets.flatMap(o => o.primitives);
-
-                if (expanded.length === 0) {
-                    this.debug('Offset expansion produced no geometry');
-                    return [];
-                }
-
-                const footprint = [];
-                for (const prim of operation.primitives) {
-                    const standardized = this.core.geometryProcessor.standardizePrimitive(prim, prim.curveIds || []);
-                    if (!standardized) continue;
-                    if (Array.isArray(standardized)) {
-                        footprint.push(...standardized);
-                    } else {
-                        footprint.push(standardized);
-                    }
-                }
-
-                if (footprint.length === 0) {
-                    this.debug('Fusion produced no copper footprint');
-                    return [];
-                }
-
-                this.debug(`Expanded boundary: ${expanded.length} primitive(s)`);
-                this.debug(`Copper footprint: ${footprint.length} primitive(s)`);
-
-                const clearanceZone = await this.core.geometryProcessor.difference(expanded, footprint);
-
-                this.debug(`Clearance polygon: ${clearanceZone.length} polygon(s)`);
-                this.debug(`=== CLEARANCE POLYGON COMPLETE ===`);
-
-                operation.clearancePolygon = clearanceZone;
-                return clearanceZone;
-
-            } finally {
-                operation.offsets = savedOffsets;
-            }
-        }
+    resolveCutSide(operation, settings) { return settings.cutSide || 'outside'; }
+    
+    /**
+     * Signed offset distance for a pass, or null when the run is over.
+     * On-line is handled before the loop - a single pass at distance 0 -
+     * so this only sees offset runs.
+     * @param {number} passIndex
+     * @param {{radius:number, sign:number, step:number, settings:Object}} ctx
+     */
+    passDistance(passIndex, { radius, sign, step, settings }) {
+      // Laser: walk outward until targetWidth reached
+      if (settings.targetWidth !== null && settings.targetWidth > 0) {
+        if (passIndex >= maxPasses) return null;
+        const currentOffset = radius + (0 === passIndex ? 0 : passIndex * step);
+        return currentOffset + radius > settings.targetWidth + PRECISION ? null : sign * currentOffset;
+      }
+
+      // CNC: explicit pass count
+      const count = Math.min(settings.passes || 1, maxPasses);
+      return passIndex >= count ? null : sign * (radius + (0 === passIndex ? 0 : passIndex * step));
     }
 
-    window.OffsetOperationHandler = OffsetOperationHandler;
+    /**
+     * Whether to skip a primitive during offset generation.
+     * Base skips drill holes/slots in CNC mode (laser processes everything).
+     */
+    shouldSkipPrimitive(primitive, settings) {
+      if (settings.clearStrategy !== undefined) return false;
+      return primitive.properties?.role === 'drill_hole' || primitive.properties?.role === 'drill_slot';
+    }
+
+    /**
+     * Whether the pre-flight circle-collapse guard should run.
+     * The guard prevents internal offsets from collapsing small circular
+     * features (e.g. drill pads in EasyTrace copper layers). Pocket
+     * operations override to false because internal collapse IS the
+     * intended termination condition.
+     */
+    shouldGuardCircleCollapse() {
+      return true;
+    }
+
+    /**
+     * Whether this operation's internal offsets form one concentric nest
+     * per region, safe to cut as a single continuous chain. True only where
+     * every pass is contained in its predecessor and one step from it:
+     * pocketing and copper clearing. External offsets are excluded - pass
+     * N+1 sits OUTSIDE pass N, so the link between them can cross stock the
+     * previous pass never touched.
+     */
+    allowsInternalStaydown() {
+      return false;
+    }
+
+    /**
+     * Whether this operation runs on copper layers, where stroke
+     * primitives (traces) must be expanded rather than boundary-offset.
+     * Isolation and clearing override to true.
+     */
+    isCopperOperation() {
+      return false;
+    }
+
+    /**
+     * Stock one preview primitive removes, as polygons to union: a band one
+     * tool diameter wide around the tool-centre ring.
+     */
+    previewCutArea(prim) {
+      const width = prim.properties.toolDiameter;
+      if (!(width > 0)) return [];
+      if ('circle' === prim.type) {
+        // A full-circle arc band is an annulus, or a disc once the ring is narrower than the tool.
+        const ring = { center: prim.center, radius: prim.radius, startAngle: 0, endAngle: 2 * Math.PI };
+        return [GeometryUtils.arcToPolygon({ ...ring, clockwise: false, properties: { polarity: 'dark' } }, width)];
+      }
+      return (prim.contours || []).flatMap((contour) => GeometryUtils.closedContourToStrokePolygons(contour, width));
+    }
+
+    /**
+     * Returns the clearance zone for filled/hatch laser strategies.
+     * Override in TraceIsolationHandler and TraceClearingHandler.
+     */
+    async getClearanceZone(operation, settings) { return null; }
+
+    // ORCHESTRATION
+
+    resolveSourceTopology(operation, params) {
+      return this.resolveContourTopology(operation.primitives, { mergeNesting: params.detectNesting === true });
+    }
+
+    async orchestrateGeneration(operation, params, core, options = {}) {
+      // Stale-run token + structured progress + state reset
+      const token = this.beginRun(operation, options, core);
+      const resolved = this.resolveSourceTopology(operation, params);
+      if (resolved) operation.primitives = resolved;
+      // Compile parameters
+      const opParams = core.pipelineContext.compileOperationParams(operation, params);
+      // Both branches get the same bag. compileOperationParams only emits
+      // the pipeline-agnostic strategy fields, so a handler reading its own
+      // profile parameters (every stencil* key) sees undefined without this.
+      const settings = { ...params, ...opParams };
+      if (opParams.isLaser) await this.generateLaserFills(operation, settings);
+      else await this.generateGeometry(operation, settings);
+      if (this.isStale(operation, token)) {
+        return {
+          success: false,
+          message: { key: 'messages.operations.superseded' },
+          status: 'warning'
+        };
+      }
+      const total = operation.offsets?.reduce((s, o) => s + (o.primitives?.length || 0), 0) || 0;
+      if (total === 0) {
+        return {
+          success: false,
+          message: { key: 'messages.operations.noGeometry' },
+          status: 'warning',
+        };
+      }
+      if (opParams.isLaser) {
+        // Laser cutout and drill declare no clear strategy and cut as offsets.
+        const strategy = opParams.clearStrategy || 'offset';
+        return {
+          success: true,
+          message: {
+            key: 'messages.operations.laserPaths',
+            values: {count: total, strategy: {key: ['params', 'laserClearStrategy', 'options', strategy]}}
+          },
+          status: 'success'
+        };
+      }
+      return {
+        success: true,
+        message: {
+          key: 'messages.operations.offsets',
+          values: { count: operation.offsets.length }
+        },
+        status: 'success'
+      };
+    }
+
+    /**
+     * Ensures every primitive in the operation has a dense sourceId.
+     * EasyShape stamps these upstream (OperationBucket.syncPrimitives).
+     * This is the universal fallback for EasyTrace and any pipeline
+     * that reaches generateGeometry without pre-stamped identity.
+     */
+    ensureSourceIds(primitives) {
+      if (!primitives || primitives.length === 0) return;
+
+      // Continue from the highest existing id so EasyShape's
+      // pre-stamped ids are never overwritten or duplicated.
+      let maxId = 0;
+      for (const prim of primitives) {
+        const id = prim.properties?.sourceId || 0;
+        if (id > maxId) maxId = id;
+      }
+
+      let stamped = 0;
+      for (const prim of primitives) {
+        if (prim.properties?.sourceId > 0) continue;
+        const id = ++maxId;
+        (prim.properties ||= {}).sourceId = id;
+        stamped++;
+      }
+
+      if (stamped > 0) this.debug(`ensureSourceIds: stamped ${stamped} primitive(s) (ids ${maxId - stamped + 1}..${maxId})`);
+    }
+
+    /**
+     * Geometric re-attribution: which source shape does this offset
+     * polygon belong to? Uses centroid proximity with a bounds-overlap
+     * prefilter. Works for internal offsets (output centroid is inside
+     * source), external offsets (output centroid is near source centroid),
+     * and merged unions (nearest source wins).
+     */
+    attributeShapeKey(poly, srcIndex) {
+      if (!srcIndex || srcIndex.length === 0) return -1;
+
+      // Circle primitives survive offset analytically
+      const pb = poly.getBounds ? poly.getBounds() : null;
+      if (!pb) return -1;
+
+      const cx = (pb.minX + pb.maxX) / 2;
+      const cy = (pb.minY + pb.maxY) / 2;
+
+      let bestId = -1;
+      let bestDistSq = Infinity;
+
+      for (const src of srcIndex) {
+        // Bounds overlap prefilter - fast reject
+        if (pb.maxX < src.bounds.minX || pb.minX > src.bounds.maxX || pb.maxY < src.bounds.minY || pb.minY > src.bounds.maxY) continue;
+
+        const dx = cx - src.cx;
+        const dy = cy - src.cy;
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq < bestDistSq) {
+          bestDistSq = distSq;
+          bestId = src.id;
+        }
+      }
+
+      return bestId;
+    }
+
+    /**
+     * Copper handlers keep stroke metadata only on primitives that are
+     * ACTUALLY strokes - Gerber traces. An SVG import in the same
+     * operation still gets normalized to a filled boundary, otherwise a
+     * stroked-but-closed region gets thickened as a centerline instead of
+     * offset as a boundary.
+     */
+    preparePrimitivesForOffset(primitives) {
+      if (!this.isCopperOperation()) return super.preparePrimitivesForOffset(primitives);
+      const traces = [];
+      const filled = [];
+      for (const prim of primitives) {
+        (this.isStrokePrimitive(prim) ? traces : filled).push(prim);
+      }
+      if (traces.length === 0) return super.preparePrimitivesForOffset(primitives);
+      return [...traces, ...super.preparePrimitivesForOffset(filled)];
+    }
+
+    /**
+     * One definition of "this is a centerline to thicken", shared by
+     * preparePrimitivesForOffset and offsetSinglePrimitive so the two can
+     * never disagree about the same primitive. isTrace is parser-stamped
+     * on Gerber traces and is authoritative. An SVG stroke is only a
+     * centerline when the path is OPEN - a closed stroked region is a
+     * boundary, and thickening it about its own outline is not an offset.
+     */
+    isStrokePrimitive(prim) {
+      const props = prim.properties || {};
+      if (!(props.strokeWidth > 0)) return false;
+      if (props.isTrace === true) return true;
+      if (props.stroke !== true || props.fill) return false;
+      return !GeometryTopology.isPrimitiveClosed(prim, PRECISION);
+    }
+
+    async offsetSinglePrimitive(primitive, distance) {
+      if (this.isCopperOperation() && this.isStrokePrimitive(primitive)) {
+        const combinedWidth = primitive.properties.strokeWidth + distance * 2;
+        return this.core.geometryOffsetter.expandStroke(primitive, combinedWidth);
+      }
+      return super.offsetSinglePrimitive(primitive, distance);
+    }
+
+    // MAIN OFFSET PIPELINE
+
+    async generateGeometry(operation, settings) {
+      // Clone to prevent mutating shared state
+      settings = { ...settings };
+
+      // The run this pass loop belongs to: a cancelled or superseded run stops at its next pass.
+      const token = operation._genToken;
+
+      this.debug('=== OFFSET PIPELINE START ===');
+      this.debug(`Operation: ${operation.id} (${operation.type})`);
+
+      if (!operation.primitives || operation.primitives.length === 0) return [];
+
+      // Identity: stamp any untagged primitives, then index each source's
+      // bounds and centroid for shapeKey attribution after the offset passes.
+      this.ensureSourceIds(operation.primitives);
+      const srcIndex = [];
+      for (const prim of operation.primitives) {
+        const id = prim.properties?.sourceId;
+        const b = id > 0 ? prim.getBounds() : null;
+        if (b) srcIndex.push({ id, bounds: b, cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2 });
+      }
+
+      // Offset direction. Resolved once; radius/sign/step derive from it.
+      const cutSide = this.resolveCutSide(operation, settings);
+      const isOnLine = cutSide === 'on';
+      const isInternal = cutSide === 'inside';
+
+      // Offset distance parameters
+      let radius, sign, step;
+
+      if (isOnLine) {
+        // on-line: single pass at distance 0
+      } else {
+        radius = settings.toolDiameter / 2;
+        sign = isInternal ? -1 : 1;
+
+        // Resolve step distance
+        const stepOverPct = settings.stepOver !== undefined ? settings.stepOver : 100;
+        step = (settings.stepDistance && settings.stepDistance > 0) ? settings.stepDistance : settings.toolDiameter * (stepOverPct / 100.0);
+      }
+
+      // Distance generator: returns null when exhausted. Subclasses that
+      // do not derive their distance from the tool radius override
+      // passDistance() instead of reimplementing the pipeline.
+      const getOffsetDistance = passIndex => isOnLine ? (passIndex === 0 ? 0 : null) : this.passDistance(passIndex, { radius, sign, step, settings });
+
+      // Guard: prevent internal offsets from collapsing small circular features
+      let forceOnLine = false;
+      if (isInternal && !isOnLine && this.shouldGuardCircleCollapse()) {
+        const circles = operation.primitives.filter(p => p.type === 'circle' && p.radius);
+        if (circles.length > 0) {
+          const smallestFeature = Math.min(...circles.map(p => p.radius * 2));
+          const firstOffset = Math.abs(getOffsetDistance(0) || 0);
+          if (smallestFeature > 0 && firstOffset >= smallestFeature / 2) {
+            this.debug(
+              `Internal offset ${firstOffset.toFixed(3)}mm would collapse features (smallest: ${smallestFeature.toFixed(3)}mm). Falling back to on-line.`
+            );
+            forceOnLine = true;
+          }
+        }
+      }
+
+      // PRE-FUSION
+      let primitivesToProcess = this.preparePrimitivesForOffset(operation.primitives);
+
+      // TOPOLOGICAL CATEGORIZATION
+      const levelBuckets = [];
+      const complexRegions = [];
+      const simpleGeometry = [];
+
+      primitivesToProcess.forEach(prim => {
+        if (this.shouldSkipPrimitive(prim, settings)) return;
+
+        if (prim.properties?.isComposited) {
+          if (prim.contours && prim.contours.length > 0) {
+            prim.contours.forEach(contour => {
+              const lvl = contour.nestingLevel || 0;
+              if (!levelBuckets[lvl]) levelBuckets[lvl] = [];
+              levelBuckets[lvl].push(new PathPrimitive([contour], { ...prim.properties }));
+            });
+          } else {
+            if (!levelBuckets[0]) levelBuckets[0] = [];
+            levelBuckets[0].push(prim);
+          }
+        } else {
+          const isTraceOrPad = prim.properties?.isTrace || prim.properties?.isPad ||
+            prim.properties?.isFlash || prim.properties?.stroke;
+
+          if (prim.type === 'path' && prim.contours && prim.contours.length > 0 && !isTraceOrPad) {
+            const hasHoles = prim.contours.some(c => c.isHole);
+            if (hasHoles) {
+              complexRegions.push(prim);
+            } else {
+              simpleGeometry.push(prim);
+            }
+          } else {
+            simpleGeometry.push(prim);
+          }
+        }
+      });
+
+      // PER-PASS OFFSET GENERATION
+      operation.offsets = [];
+      const passResults = [];
+
+      // Offsets yield on the task slice: a pass over thousands of
+      // primitives would otherwise hold the thread, and the overlay and
+      // Cancel with it, from start to end.
+      const processGroup = async (group, dist) => {
+        const results = [];
+        for (const prim of group) {
+          if (this.yieldDue) await this.yieldToEventLoop();
+          results.push(await this.offsetSinglePrimitive(prim, dist));
+        }
+        const out = [];
+        for (let gi = 0; gi < results.length; gi++) {
+          const srcId = group[gi].properties?.sourceId ?? 0;   // carry source-shape identity
+          const res = results[gi];
+          const push = (r) => {
+            if (!r) return;
+            (r.properties ||= {}).sourceId = srcId;
+            // Stamp every non-arc point so the Z channel carries identity through Clipper.
+            if (srcId > 0 && r.contours) {
+              for (const c of r.contours) {
+                if (!c.points) continue;
+                for (const pt of c.points) {
+                  if (!pt.curveId || pt.curveId <= 0) pt.sourceId = srcId;
+                }
+              }
+            }
+            out.push(r);
+          };
+          if (Array.isArray(res)) res.forEach(push);
+          else push(res);
+        }
+        return out;
+      };
+
+      // Progress: structured ticks through the operation's callback.
+      // The state manager owns the overlay element, the label format
+      // and rAF coalescing.
+      const onProgress = operation._onProgress || null;
+      // Laser targetWidth walks outward until the width is met, so it
+      // has no known count → indeterminate (frac null = spinner only).
+      const totalPasses = (isOnLine || forceOnLine || settings.targetWidth > 0) ? 0 : Math.min(settings.passes || 1, maxPasses);
+
+      let passIndex = 0;
+      while (true) {
+        const distance = forceOnLine ? (passIndex === 0 ? 0 : null) : getOffsetDistance(passIndex);
+
+        if (distance === null) break;
+        if (passIndex >= maxPasses) {
+          console.warn(`[OffsetOperationHandler] Reached safeguard limit of ${maxPasses} passes. Halting.`);
+          break;
+        }
+
+        // Tick + macrotask yield before every pass, the first included,
+        // so the overlay paints and Cancel is heard between
+        // Clipper-bound passes.
+        onProgress?.({
+          frac: totalPasses > 0 ? passIndex / totalPasses : null,
+          label: {
+            key: totalPasses > 0 ? 'progress.offsetPassOf' : 'progress.offsetPass',
+            values: { op: { key: `ops.${operation.type}.label` }, pass: passIndex + 1, total: totalPasses }
+          }
+        });
+        await this.yieldToEventLoop();
+        if (this.isStale(operation, token)) return operation.offsets;
+
+        const offsetType = distance >= 0 ? 'external' : 'internal';
+
+        this.debug(`--- PASS ${passIndex + 1}: ${distance.toFixed(3)}mm (${offsetType}) ---`);
+
+        let passGeometry = [];
+
+        if (levelBuckets.length > 0) {
+          // Level-by-Level Recomposition (Like Eagle geometry)
+          const offsetSimpleGeom = await processGroup(simpleGeometry, distance);
+
+          for (let lvl = 0; lvl < levelBuckets.length; lvl++) {
+            const bucket = levelBuckets[lvl];
+            if (!bucket || bucket.length === 0) continue;
+
+            const isHoleLevel = lvl % 2 === 1;
+            const dist = isHoleLevel ? -distance : distance;
+            const offsetBucket = await processGroup(bucket, dist);
+
+            if (offsetBucket.length === 0) continue;
+
+            if (lvl === 0) {
+              passGeometry = await this.core.geometryProcessor.unionGeometry(offsetBucket);
+            } else if (isHoleLevel) {
+              const holeUnion = await this.core.geometryProcessor.unionGeometry(offsetBucket);
+              if (passGeometry.length > 0) passGeometry = await this.core.geometryProcessor.difference(passGeometry, holeUnion);
+            } else {
+              const islandUnion = await this.core.geometryProcessor.unionGeometry(offsetBucket);
+              passGeometry = await this.core.geometryProcessor.unionGeometry(passGeometry.concat(islandUnion));
+            }
+          }
+
+          if (offsetSimpleGeom.length > 0) {
+            if (passGeometry.length > 0) {
+              passGeometry = await this.core.geometryProcessor.unionGeometry(passGeometry.concat(offsetSimpleGeom));
+            } else {
+              passGeometry = await this.core.geometryProcessor.unionGeometry(offsetSimpleGeom);
+            }
+          }
+        } else {
+          // Per-Region Resolution (Like KiCAD geometry)
+          const offsetSimpleGeom = await processGroup(simpleGeometry, distance);
+          const resolvedOffsetRegions = [];
+
+          for (const regionPrim of complexRegions) {
+            const regionShells = [];
+            const regionHoles = [];
+
+            regionPrim.contours.forEach(contour => {
+              const simplePrim = new PathPrimitive([contour], { ...regionPrim.properties });
+              if (contour.isHole) regionHoles.push(simplePrim);
+              else regionShells.push(simplePrim);
+            });
+
+            const offsetShells = await processGroup(regionShells, distance);
+            const offsetHoles = await processGroup(regionHoles, -distance);
+
+            let regionResult = [];
+            if (offsetShells.length > 0) {
+              const shellUnion = await this.core.geometryProcessor.unionGeometry(offsetShells);
+              if (offsetHoles.length > 0) {
+                const holeUnion = await this.core.geometryProcessor.unionGeometry(offsetHoles);
+                regionResult = await this.core.geometryProcessor.difference(shellUnion, holeUnion);
+              } else {
+                regionResult = shellUnion;
+              }
+            }
+            if (regionResult.length > 0) resolvedOffsetRegions.push(...regionResult);
+          }
+
+          if (resolvedOffsetRegions.length > 0) {
+            if (offsetSimpleGeom.length > 0) {
+              passGeometry = await this.core.geometryProcessor.unionGeometry(resolvedOffsetRegions.concat(offsetSimpleGeom));
+            } else {
+              passGeometry = await this.core.geometryProcessor.unionGeometry(resolvedOffsetRegions);
+            }
+          } else if (offsetSimpleGeom.length > 0) {
+            passGeometry = await this.core.geometryProcessor.unionGeometry(offsetSimpleGeom);
+          }
+        }
+
+        // Early termination: geometry collapsed to nothing at this distance
+        if (passGeometry.length === 0) {
+          this.debug(`Pass ${passIndex + 1}: geometry collapsed at ${distance.toFixed(3)}mm. Halting.`);
+          break;
+        }
+
+        // POST-PROCESSING
+        // Runs at distance 0 too: an on-line pass is still a union - it is
+        // what merges overlapping closed shapes into one outline - and
+        // jsPathToClipper tessellates whatever it is handed, so arcs come
+        // back only through reconstruction.
+        if (!settings.skipArcReconstruction) passGeometry = this.core.geometryProcessor.arcReconstructor.processForReconstruction(passGeometry);
+
+        const thermalGroup = distance < 0 ? 'internal' : 'external';
+
+        const chainable = isInternal && !isOnLine && !forceOnLine && this.allowsInternalStaydown();
+
+        const reconstructedGeometry = passGeometry.map(p => {
+          if (!p.properties) p.properties = {};
+          p.properties.isOffset = true;
+          p.properties.pass = passIndex + 1;
+          p.properties.offsetDistance = distance;
+          p.properties.offsetType = offsetType;
+          p.properties.shapeKey = this.attributeShapeKey(p, srcIndex); // identity surviving the boolean union
+          if (chainable) {
+            // The translator welds a key's rings into one plan so the
+            // depth ladder runs across the whole nest instead of once
+            // per ring. Only the offsetter knows the passes are
+            // concentric and one step apart; nothing downstream can
+            // re-derive it from the geometry.
+            p.properties.staydownChain = true;
+            p.properties.chainKey = p.properties.shapeKey;
+            p.properties.chainPass = passIndex + 1;
+          }
+          return p;
+        });
+
+        passResults.push({
+          distance: distance,
+          pass: passIndex + 1,
+          offsetType: offsetType,
+          primitives: reconstructedGeometry,
+          metadata: {
+            sourceCount: primitivesToProcess.length,
+            generatedAt: Date.now(),
+            toolDiameter: settings.toolDiameter,
+            targetWidth: settings.targetWidth || null,
+            actualWidth: Math.abs(distance) + settings.toolDiameter / 2,
+            thermalGroup: thermalGroup,
+          },
+        });
+
+        passIndex++;
+      }
+
+      // Calculate actual width based on the last successful pass
+      const actualWidth = passResults.length > 0 ? Math.abs(passResults[passResults.length - 1].distance) + (settings.toolDiameter / 2) : 0;
+
+      // COMBINE PASSES
+      if (settings.combineOffsets && passResults.length > 1) {
+        const allPassPrimitives = passResults.flatMap(p => p.primitives);
+        operation.offsets = [{
+          id: this.offsetRecordId(operation.id, 'combined'),
+          distance: passResults[0].distance,
+          pass: 1,
+          primitives: allPassPrimitives,
+          type: 'offset',
+          metadata: {
+            sourceCount: primitivesToProcess.length,
+            generatedAt: Date.now(),
+            toolDiameter: settings.toolDiameter,
+            targetWidth: settings.targetWidth || null,
+            actualWidth: actualWidth,
+            offset: {
+              combined: true,
+              passes: passResults.length,
+              offsetCount: allPassPrimitives.length
+            }
+          },
+          settings: { ...settings }
+        }];
+      } else {
+        operation.offsets = passResults.map((passResult, index) => ({
+          id: this.offsetRecordId(operation.id, index),
+          ...passResult,
+          settings: { ...settings }
+        }));
+      }
+
+      const totalPrimitives = operation.offsets.reduce((sum, o) => sum + o.primitives.length, 0);
+      this.debug(`Generated ${operation.offsets.length} offset group(s), ${totalPrimitives} total primitives.`);
+      this.debug(`=== OFFSET PIPELINE COMPLETE ===`);
+
+      return operation.offsets;
+    }
+
+    // LASER GEOMETRY
+
+    async generateLaserFills(operation, settings) {
+      this.debug(`=== LASER GEOMETRY GENERATION: ${settings.clearStrategy} ===`);
+
+      const strategy = settings.clearStrategy || 'offset';
+
+      if (strategy === 'offset') {
+        await this.generateGeometry(operation, settings);
+        return operation.offsets;
+      }
+
+      // Filled/hatch strategies need a clearance zone
+      const clearanceZone = await this.getClearanceZone(operation, settings);
+
+      if (!clearanceZone || clearanceZone.length === 0) {
+        this.debug('Clearance zone empty, falling back to offset strategy');
+        await this.generateGeometry(operation, settings);
+        return operation.offsets;
+      }
+
+      switch (strategy) {
+        case 'filled': {
+          let filledGeometry = clearanceZone;
+          if (this.core.geometryProcessor?.arcReconstructor) {
+            filledGeometry = this.core.geometryProcessor.arcReconstructor.processForReconstruction(clearanceZone);
+            this.debug(`Filled: reconstructed ${clearanceZone.length} → ${filledGeometry.length} primitives`);
+          }
+
+          operation.offsets = [{
+            distance: 0,
+            pass: 1,
+            type: 'filled',
+            primitives: filledGeometry,
+            metadata: {
+              strategy: 'filled',
+              isolationWidth: settings.isolationWidth || 0,
+              isBoardClearing: settings.isBoardClearing || false
+            }
+          }];
+          break;
+        }
+
+        case 'hatch': {
+          if (typeof HatchGenerator !== 'undefined') {
+            operation.offsets = HatchGenerator.generate(clearanceZone, settings);
+            this.debug(`Hatch: generated ${operation.offsets.length} pass(es)`);
+          } else {
+            console.warn('[OffsetOperationHandler] HatchGenerator missing, falling back to offset.');
+            await this.generateGeometry(operation, settings);
+          }
+          break;
+        }
+
+        default:
+          this.debug(`Unknown laser strategy: ${strategy}, falling back to offset`);
+          await this.generateGeometry(operation, settings);
+          break;
+      }
+
+      return operation.offsets;
+    }
+
+    // CLEARANCE POLYGON (shared helper for filled/hatch)
+    async generateClearancePolygon(operation, isolationWidth) {
+      if (!operation.primitives || operation.primitives.length === 0) return [];
+
+      this.debug(`=== CLEARANCE POLYGON GENERATION: width=${isolationWidth.toFixed(3)}mm ===`);
+
+      const savedOffsets = operation.offsets;
+
+      try {
+        await this.generateGeometry(operation, {
+          toolDiameter: isolationWidth * 2,
+          passes: 1,
+          stepOver: 0,
+          combineOffsets: true,
+          skipArcReconstruction: true
+        });
+
+        const expanded = operation.offsets.flatMap(o => o.primitives);
+        if (expanded.length === 0) {
+          this.debug('Offset expansion produced no geometry');
+          return [];
+        }
+
+        const footprint = [];
+        for (const prim of operation.primitives) {
+          const standardized = this.core.geometryProcessor.standardizePrimitive(prim, prim.curveIds || []);
+          if (!standardized) continue;
+          if (Array.isArray(standardized)) {
+            footprint.push(...standardized);
+          } else {
+            footprint.push(standardized);
+          }
+        }
+
+        if (footprint.length === 0) {
+          this.debug('Fusion produced no copper footprint');
+          return [];
+        }
+
+        this.debug(`Expanded boundary: ${expanded.length} primitive(s)`);
+        this.debug(`Copper footprint: ${footprint.length} primitive(s)`);
+
+        const clearanceZone = await this.core.geometryProcessor.difference(expanded, footprint);
+
+        this.debug(`Clearance polygon: ${clearanceZone.length} polygon(s)`);
+        this.debug(`=== CLEARANCE POLYGON COMPLETE ===`);
+
+        return clearanceZone;
+      } finally {
+        operation.offsets = savedOffsets;
+      }
+    }
+  }
+
+  ROOT.OffsetOperationHandler = OffsetOperationHandler;
 })();

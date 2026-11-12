@@ -8,142 +8,168 @@
  *
  * @author      Eltryus - Ricardo Marques
  * @copyright   2025-2026 Eltryus - Ricardo Marques
- * @see         {@link https://github.com/RicardoJCMarques/EasyTrace5000}
+ * @see         {@link https://github.com/RicardoJCMarques/EasyCAM5000}
  *
  * SPDX-FileCopyrightText: 2025-2026 Eltryus - Ricardo Marques
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 (function() {
-    'use strict';
+  'use strict';
 
-    class ShortcutManager {
-        constructor() {
-            this.shortcuts = [];
-            this.modalManager = null;
-
-            document.addEventListener('keydown', (e) => this.handleKeyDown(e));
-        }
-
-        /**
-         * @param {ModalManager} mm
-         */
-        setModalManager(mm) {
-            this.modalManager = mm;
-        }
-
-        /**
-         * Register a keyboard shortcut.
-         *
-         * @param {string}   combo      Key or combo: 'g', 'Delete', 'ctrl+z',
-         *                              'ctrl+shift+g', 'ArrowLeft', 'F1', 'F6'
-         * @param {Function} callback   (event) => void
-         * @param {object}   [options]
-         * @param {boolean}  [options.mod]          Requires Ctrl/Meta
-         * @param {boolean}  [options.shift]        Requires Shift
-         * @param {boolean}  [options.allowInTree]  If false, skip when focus
-         *                                          is inside a tree panel
-         */
-        register(combo, callback, options = {}) {
-            const parsed = this.parseCombo(combo);
-            this.shortcuts.push({
-                ...parsed,
-                callback,
-                allowInTree: options.allowInTree !== false,
-                mod: options.mod || parsed.mod,
-                shift: options.shift || parsed.shift
-            });
-        }
-
-        unregister(combo, callback) {
-            const parsed = this.parseCombo(combo);
-            this.shortcuts = this.shortcuts.filter(s =>
-                !(s.key === parsed.key && s.mod === parsed.mod &&
-                  s.shift === parsed.shift && s.callback === callback)
-            );
-        }
-
-        parseCombo(combo) {
-            const parts = combo.toLowerCase().split('+');
-            const key = parts[parts.length - 1];
-            const mod = parts.includes('ctrl') || parts.includes('meta');
-            const shift = parts.includes('shift');
-            return { key, mod, shift };
-        }
-
-        handleKeyDown(e) {
-            // Modal active → only Escape routes to modal handler
-            if (this.modalManager?.activeModal) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    this.modalManager.handleEscapeKey();
-                }
-                // Let Tab through for focus trap (handled by ModalManager)
-                return;
-            }
-
-            // Editing an input → only Escape blurs
-            if (this.isEditing(e.target)) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    e.target.blur();
-                }
-                return;
-            }
-
-            // Close open dropdown on Escape before checking shortcuts
-            if (e.key === 'Escape') {
-                const openDropdown = document.querySelector('.dropdown-content.show');
-                if (openDropdown) {
-                    e.preventDefault();
-                    openDropdown.classList.remove('show');
-                    const btn = openDropdown.previousElementSibling;
-                    if (btn) { btn.classList.remove('active'); btn.setAttribute('aria-expanded', 'false'); }
-                    return;
-                }
-            }
-
-            // If focus is inside a tree panel and the key is an arrow,
-            // let the tree's own handler deal with it
-            const isInTree = e.target.closest('#operations-tree, #scene-tree-list, #operations-bucket-list');
-            const isArrowKey = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key);
-            if (isInTree && isArrowKey) return;
-
-            // Match against registered shortcuts
-            const isMod = e.ctrlKey || e.metaKey;
-            const isShift = e.shiftKey;
-            const keyLower = e.key.toLowerCase();
-
-            for (const shortcut of this.shortcuts) {
-                // Modifier matching
-                if (shortcut.mod && !isMod) continue;
-                if (!shortcut.mod && isMod && !['escape'].includes(shortcut.key)) continue;
-                if (shortcut.shift && !isShift) continue;
-                if (!shortcut.shift && isShift && shortcut.mod) continue; // REVIEW - This doesn't lock a plain key from triggering even with shift modifier on? Could be problematic when shortcuts overlap?
-
-                // Key matching (case-insensitive for letters)
-                const matchKey = shortcut.key === keyLower ||
-                                 shortcut.key === e.key ||
-                                 shortcut.key === e.code;
-
-                if (!matchKey) continue;
-
-                // Tree guard
-                if (isInTree && !shortcut.allowInTree) continue;
-
-                e.preventDefault();
-                shortcut.callback(e);
-                return;
-            }
-        }
-
-        isEditing(target) {
-            return target.matches(
-                'input, textarea, select, [contenteditable="true"], .property-field input, .property-field select'
-            );
-        }
+  class ShortcutManager {
+    /** @param {ModalManager} modalManager */
+    constructor(modalManager) {
+      this.shortcuts = [];
+      this.actions = {};
+      this.modalManager = modalManager;
+      document.addEventListener('keydown', e => this.handleKeyDown(e));
     }
 
-    window.ShortcutManager = ShortcutManager;
+    /**
+     * Named actions, so a combo table can be data. An action with no handler
+     * is a table entry for a feature this app does not have - skipped, not an
+     * error, because both apps read from the same shared table.
+     */
+    registerActions(map) {
+      Object.assign(this.actions, map);
+    }
+
+    /**
+     * [{ combo, action, args, mod, shift, alt, allowInTree, shiftOptional }]
+     * `args` is what lets one action back many keys - five category keys and
+     * four pan directions are one handler each, not nine.
+     * Handlers come from registerActions; a combo whose action has none is a
+     * table entry for a feature this app lacks, skipped rather than an error.
+     */
+    applyTable(table) {
+      for (const entry of table || []) {
+        const fn = this.actions[entry.action];
+        if (typeof fn !== 'function') continue;
+        const args = entry.args;
+        this.register(entry.combo, args ? e => fn(e, ...args) : fn, entry);
+      }
+    }
+
+    /**
+     * Register a keyboard shortcut.
+     *
+     * @param {string}   combo      Key or combo: 'g', 'Delete', 'ctrl+z',
+     *                              'ctrl+shift+g', 'ArrowLeft', 'F1', 'F6'
+     * @param {Function} callback   (event) => void
+     * @param {object}   [options]
+     * @param {boolean}  [options.mod]           Requires Ctrl/Meta
+     * @param {boolean}  [options.shift]         Requires Shift
+     * @param {boolean}  [options.allowInTree]   If false, skip when focus
+     *                                           is inside a tree panel
+     * @param {boolean}  [options.shiftOptional] Allow Shift to be held.
+     *                                           Set it when the callback
+     *                                           reads e.shiftKey, or when
+     *                                           the key is itself shifted.
+     */
+    register(combo, callback, options = {}) {
+      const parsed = this.parseCombo(combo);
+      this.shortcuts.push({
+        ...parsed,
+        callback,
+        allowInTree: options.allowInTree !== false,
+        allowInModal: options.allowInModal === true,
+        // Shift is exclusive by default. Opt out when the callback
+        // reads e.shiftKey itself (F6 reverse cycling, Shift-pan) or
+        // when the key IS a shifted keystroke ('+' is Shift+= on most
+        // layouts, so a strict check would make it unreachable).
+        shiftOptional: options.shiftOptional === true,
+        mod: options.mod || parsed.mod,
+        shift: options.shift || parsed.shift,
+        alt: options.alt || parsed.alt
+      });
+    }
+
+    parseCombo(combo) {
+      const parts = combo.toLowerCase().split('+');
+      const key = parts[parts.length - 1];
+      const mod = parts.includes('ctrl') || parts.includes('meta');
+      const shift = parts.includes('shift');
+      const alt = parts.includes('alt');
+      return { key, mod, shift, alt };
+    }
+
+    handleKeyDown(e) {
+      const inModal = !!this.modalManager.activeModal;
+
+      // Modal active → Escape dismisses
+      if (inModal && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.modalManager.dismissModal();
+        return;
+      }
+
+      const isEditing = this.isEditing(e.target);
+      if (isEditing && e.key === 'Escape') {
+        e.preventDefault();
+        e.target.blur();
+        return;
+      }
+
+      // Close open dropdown on Escape before checking shortcuts
+      if (e.key === 'Escape') {
+        const openDropdown = document.querySelector('.dropdown-content.is-open');
+        if (openDropdown) {
+          e.preventDefault();
+          openDropdown.classList.remove('is-open');
+          const btn = openDropdown.previousElementSibling;
+          if (btn) {
+            btn.classList.remove('active');
+            btn.setAttribute('aria-expanded', 'false');
+            btn.focus();
+          }
+          return;
+        }
+      }
+
+      // Match against registered shortcuts
+      const isMod = e.ctrlKey || e.metaKey;
+      const isShift = e.shiftKey;
+      const isAlt = e.altKey;
+      const keyLower = e.key.toLowerCase();
+
+      for (const shortcut of this.shortcuts) {
+        if (shortcut.mod && !isMod) continue;
+        if (!shortcut.mod && isMod && shortcut.key !== 'escape') continue;
+        if (shortcut.shift && !isShift) continue;
+        if (!shortcut.shift && isShift && !shortcut.shiftOptional) continue;
+        if (shortcut.alt && !isAlt) continue;
+        if (!shortcut.alt && isAlt) continue;
+
+        const matchKey = shortcut.key === keyLower || shortcut.key === e.key || shortcut.key === e.code;
+        if (!matchKey) continue;
+
+        // Modal guard: allow only explicit modal-whitelisted shortcuts
+        if (inModal && !shortcut.allowInModal) return;
+
+        // Editing guard: allow modal-whitelisted shortcuts even if a field has focus
+        if (isEditing && !shortcut.allowInModal) return;
+
+        const inTree = !inModal && !!e.target.closest('#operations-tree, #scene-tree-list, #operations-bucket-list');
+        const inForm = !inModal && !!e.target.closest('.property-field');
+        const isArrowKey = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key);
+        if ((inTree || inForm) && isArrowKey) return;
+        if (inTree && !shortcut.allowInTree) return;
+
+        const isTypeable = !isMod && !isAlt && (e.key.length === 1 || ['Delete', 'Backspace', 'Enter', ' '].includes(e.key));
+        if (inForm && isTypeable) return;
+
+        e.preventDefault();
+        shortcut.callback(e);
+        return;
+      }
+    }
+
+    isEditing(target) {
+      return target.matches('input, textarea, select, [contenteditable="true"], .property-field input, .property-field select');
+    }
+  }
+
+  window.ShortcutManager = ShortcutManager;
 })();

@@ -1,16 +1,43 @@
 {
-  "_projectInfo": {
-    "file": "dark.json",
-    "description": "Dark Theme",
-    "author": "Eltryus - Ricardo Marques",
-    "see": "https://github.com/RicardoJCMarques/EasyTrace5000",
-    "license": "AGPL-3.0-or-later",
-    "copyright": "Copyright (C) 2025-2026 Eltryus - Ricardo Marques"
-  },
-
-  "version": "0.9",
-  
+  "_readme": [
+    "REFERENCE THEME. dark.json declares the complete key set and is the",
+    "default: css/theme.css is generated from it by .github/scripts/sync-theme.js,",
+    "so a page on the default fetches no theme file. theme.css's :root block",
+    "must never be hand-edited.",
+    "",
+    "Themes are never partial: every other theme declares every key this file",
+    "declares, because the loader writes a theme over theme.css and a missing",
+    "key would show this file's value. sync-theme.js refuses a shipped theme",
+    "that is incomplete; a key added here is added to every theme in the same",
+    "change.",
+    "",
+    "colors.<group>.<key> -> --color-<prefix>-<kebab-key>. Group prefixes are fixed",
+    "in the loader's mapping table; do not rename a group without updating both the",
+    "loader and sync-theme.js.",
+    "",
+    "tokens.<name> -> --<name>, emitted verbatim with NO prefix. Structure and",
+    "sizing live in css/base.css; this block exists so an accessibility or custom",
+    "theme can override a specific structural token (shadows, radii, focus ring)",
+    "without a second mechanism, and only a token base.css declares. The reference",
+    "theme leaves it empty on purpose - populating it here would duplicate",
+    "base.css and drift.",
+    "",
+    "Colours are opaque by policy: the palette is composited, and overlapping",
+    "transparency is unmanageable. Values are 6-digit hex; the loader reports",
+    "anything else and sync-theme.js refuses it. semantic.scrim/scrimStrong are",
+    "the sanctioned exception - a modal backdrop must be see-through - and use",
+    "rgb()/hsl() functional forms."
+  ],
+  "meta": {"kind": "theme"},
   "id": "dark",
+  "base": "dark",
+  "description": "Default dark theme. Reference schema for all other themes.",
+  "author": "Eltryus - Ricardo Marques",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/RicardoJCMarques/EasyCAM5000",
+
+  "tokens": {},
+
   "colors": {
     "background": {
       "primary": "#0f0f0f",
@@ -23,7 +50,8 @@
       "primary": "#e5e5e5",
       "secondary": "#a0a0a0",
       "disabled": "#606060",
-      "hint": "#666666"
+      "hint": "#666666",
+      "onEmphasis": "#ffffff"
     },
     "border": {
       "primary": "#2a2a2a",
@@ -39,17 +67,28 @@
       "success": "#22c55e",
       "warning": "#f59e0b",
       "error": "#ef4444",
-      "info": "#06b6d4"
+      "info": "#06b6d4",
+      "scrim": "rgba(0, 0, 0, 0.6)",
+      "scrimStrong": "rgba(0, 0, 0, 0.8)"
     },
+
     "operations": {
       "isolation": "#ff8844",
       "drill": "#4488ff",
       "clearing": "#44ff88",
       "cutout": "#ff00ff",
       "stencil": "#90177d",
-      "toolpath": "#00ffff"
+      "toolpath": "#00ffff",
+      "profile": "#6dd3a0",
+      "pocket": "#5a8acf",
+      "engrave": "#c794d6",
+      "vcarve": "#e07a7a",
+      "relief": "#e0a97a",
+      "rotary": "#7ab8e0",
+      "pattern": "#a8b56d"
     },
-    "canvas": {
+
+    "render2d": {
       "background": "#0f0f0f",
       "grid": "#aaaaaa",
       "origin": "#aaaaaa",
@@ -58,6 +97,25 @@
       "ruler": "#aaaaaa",
       "rulerText": "#aaaaaa"
     },
+
+    "render3d": {
+      "background": "#16181c",
+      "sky": "#ffffff",
+      "ground": "#c9ced6",
+      "grid": "#2a2e34",
+      "gridCenter": "#3a3f46",
+      "rapid": "#565b63",
+      "cutShallow": "#4fc3f7",
+      "cutDeep": "#e07a7a",
+      "stock": "#8a7a5c",
+      "surface": "#b0a58e",
+      "tool": "#d8dde3",
+      "axisX": "#ff4d4d",
+      "axisY": "#4dcc4d",
+      "axisZ": "#4d79ff",
+      "workholding": "#565b63"
+    },
+
     "geometry": {
       "source": {
         "isolation": "#ff8844",
@@ -79,41 +137,46 @@
         "filled": "#0060dd"
       }
     },
-    
+
     "primitives": {
       "offsetInternal": "#00aa00",
       "offsetExternal": "#ff0000",
-      "peckMarkGood": "#16d329ff",
-      "peckMarkWarn": "#d2cb00ff",
+      "peckMarkGood": "#16d329",
+      "peckMarkWarn": "#d2cb00",
       "peckMarkError": "#ff0000",
-      "peckMarkSlow": "#ff5e00ff",
+      "peckMarkSlow": "#ff5e00",
       "reconstructed": "#00ffff",
-      "reconstructedPath": "#ffff00",
-      "debugContourColors": ["#00ff00", "#ff0000", "#0000ff", "#ffff00", "#ff00ff", "#00ffff"],
-      "debugCurveColors": ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff", "#00ffff"],
-      "debugLabel": "#FFFFFF",
-      "debugLabelStroke": "#000000"
+      "reconstructedPath": "#ffff00"
     },
+
     "debug": {
       "points": "#ff00ff",
       "arcs": "#00ffff",
       "wireframe": "#00aa00",
       "bounds": "#ff0000",
-      "preprocessed-stroke": "#00ffff",
-      "preprocessed-fill": "#0a3333"
+      "preprocessedStroke": "#00ffff",
+      "preprocessedFill": "#0a3333"
     },
-    "bw":{
+
+    "bw": {
       "black": "#000000",
       "white": "#ffffff"
     },
+
     "pipelines": {
       "cnc": "#ff8844",
-      "laser": "#a855f7"
+      "laser": "#a855f7",
+      "3d": "#22d3ee"
     },
+
     "interaction": {
-      "sponsorship": "#6366f1", 
-      "sponsorshipText": "#e9d5ff",
-      "kofi": "#42d6aa" 
+      "sponsorship": "#6366f1",
+      "kofi": "#42d6aa",
+      "selectionStroke": "#22d3ee",
+      "selectionFill": "#0a3f47",
+      "marqueeStroke": "#3b82f6",
+      "marqueeFill": "#112240",
+      "groupBounds": "#22d3ee"
     }
   }
 }

@@ -1,539 +1,550 @@
 /*!
  * @file        easyshape5000/ui-shape-buckets-panel.js
- * @description Operation buckets panel - EasyShape5000 only.
+ * @description Operation buckets panel
  *              Manages the operation list below the scene tree.
  *              Each bucket represents one CAM operation with three
  *              stage nodes: Geometry, Offsets, Preview.
  *              Emits events - the controller decides what to execute.
  * @author      Eltryus - Ricardo Marques
  * @copyright   2025-2026 Eltryus - Ricardo Marques
- * @see         {@link https://github.com/RicardoJCMarques/EasyTrace5000}
+ * @see         {@link https://github.com/RicardoJCMarques/EasyCAM5000}
  *
  * SPDX-FileCopyrightText: 2025-2026 Eltryus - Ricardo Marques
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 (function() {
-    'use strict';
+  'use strict';
 
-    // ═══════════════════════════════════════════════════════════════
-    // Data Model
-    // ═══════════════════════════════════════════════════════════════
+  // ────────────────────────────────────────────────────────────────────
+  // Data Model
+  // ────────────────────────────────────────────────────────────────────
 
-    class OperationBucket {
-        constructor(operationId, type, label, shapeRefs) {
-            this.id = operationId;       // Same as the operation ID in core.operations[]
-            this.type = type;
-            this.label = label;
-            this.shapeRefs = Array.isArray(shapeRefs) ? [...shapeRefs] : [shapeRefs];
-            this.settings = {};
-        }
-
-        /**
-         * Syncs primitives from scene current shapes into the operation in core.
-         */
-        syncPrimitives(core, scene) {
-            const operation = core.getOperation(this.id);
-            if (!operation) return;
-
-            operation.primitives = [];
-            operation.shapeKeyToNodeId = new Map();   // dense sourceId → scene node id (UI / debug / future reorder)
-            let shapeKeySeq = 0;
-            const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-
-            for (const sid of this.shapeRefs) {
-                const shape = scene.findShape(sid);
-                if (!shape?.primitive) continue;
-
-                // Transform primitive to world space so offsets render correctly
-                const m = shape.getWorldMatrix();
-                const transformed = GeometryUtils.transformPrimitive(shape.primitive, m);
-                if (!transformed) continue;
-
-                // Per-operation dense identity (1..N).
-                const sourceId = ++shapeKeySeq;
-                (transformed.properties ||= {}).sourceId = sourceId;
-                operation.shapeKeyToNodeId.set(sourceId, sid);
-
-                // Stamp non-arc points so the Z channel carries identity through Clipper booleans.
-                // Only full circles don't have non-arc points.
-                if (transformed.contours) {
-                    for (const c of transformed.contours) {
-                        if (!c.points) continue;
-                        for (const pt of c.points) {
-                            if (!pt.curveId || pt.curveId <= 0) pt.sourceId = sourceId;
-                        }
-                    }
-                }
-
-                operation.primitives.push(transformed);
-
-                // Bounds from the already-transformed primitive
-                const b = transformed.getBounds();
-                if (b) {
-                    if (b.minX < bounds.minX) bounds.minX = b.minX;
-                    if (b.minY < bounds.minY) bounds.minY = b.minY;
-                    if (b.maxX > bounds.maxX) bounds.maxX = b.maxX;
-                    if (b.maxY > bounds.maxY) bounds.maxY = b.maxY;
-                }
-            }
-
-            operation.bounds = isFinite(bounds.minX) ? bounds : { minX: 0, minY: 0, maxX: 0, maxY: 0 };
-        }
-
-        /**
-         * Reads current state from the real operation in core.
-         */
-        getOperation(core) {
-            return core.operations.find(op => op.id === this.id) || null;
-        }
-
-        get hasOffsets() {
-            // Caller must pass core or this must be checked via getOperation
-            // For DOM state checks, NavOperationsPanel passes core through
-            return this.cachedHasOffsets || false;
-        }
-
-        get hasPreview() {
-            return this.cachedHasPreview || false;
-        }
-
-        /**
-         * Updates cached flags from the real operation. Called after generation.
-         */
-        syncStateFromOperation(core) {
-            const op = this.getOperation(core);
-            if (!op) return;
-            this.cachedHasOffsets = op.offsets && op.offsets.length > 0;
-            this.cachedHasPreview = op.preview?.ready === true;
-            // Clear invalidation after successful generation
-            if (this.cachedHasOffsets) {
-                this.isInvalidated = false;
-                this.invalidatedReason = null;
-            }
-        }
+  class OperationBucket {
+    constructor(operationId, type, label, shapeRefs) {
+      this.id = operationId; // Same as the operation ID in core.operations[]
+      this.type = type;
+      this.label = label;
+      this.shapeRefs = Array.isArray(shapeRefs) ? [...shapeRefs] : [shapeRefs];
+      this.settings = {};
+      this.cachedHasOffsets = false;
+      this.cachedHasPreview = false;
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Panel UI
-    // ═══════════════════════════════════════════════════════════════
-
-    class NavOperationsPanel extends EventEmitter {
-        constructor() {
-            // Event emitter
-            super();
-
-            this.container = null;
-            this.buckets = new Map();
-            this.selectedNode = null; // { bucketId, stage }
+    /** Syncs primitives from scene current shapes into the operation in core. */
+    syncPrimitives(core, scene) {
+      const operation = core.store.getOperation(this.id);
+      if (!operation) throw new Error(`[OperationBucket] ${this.id} has no core operation`);
+      operation.primitives = [];
+      operation.shapeKeyToNodeId = new Map(); // dense sourceId → scene node id
+      // One mesh per operation: createAndGenerate refuses a selection with more.
+      operation.sourceMesh = null;
+      let shapeKeySeq = 0;
+      const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+      const growBounds = b => {
+        if (!b) return;
+        if (b.minX < bounds.minX) bounds.minX = b.minX;
+        if (b.minY < bounds.minY) bounds.minY = b.minY;
+        if (b.maxX > bounds.maxX) bounds.maxX = b.maxX;
+        if (b.maxY > bounds.maxY) bounds.maxY = b.maxY;
+      };
+      for (const sid of this.shapeRefs) {
+        const shape = scene.findShape(sid);
+        if (!shape?.primitive) continue;
+        const m = shape.getWorldMatrix();
+        // Baked through the full placement so moved, rotated or scaled meshes carve
+        // in place: the flat one (tilt, world matrix, Z lift), or for a rotary
+        // operation the radial one about the axis through the origin. An untouched
+        // shape in the flat scene keeps the mesh's own triangles.
+        if (shape.mesh?.triangles?.length) {
+          const res = this.type === 'rotary'
+            ? Transform3D.placeMeshRadial(shape.mesh, shape.transform, m, FieldParams.radialFrame(core.settings))
+            : Transform3D.placeMesh(shape.mesh, shape.transform, m);
+          const b3 = res.bounds3D ?? shape.mesh.bounds3D;
+          operation.sourceMesh = {
+            ...shape.mesh,
+            triangles: res.triangles,
+            bounds3D: b3,
+            offsetZ: this.type === 'rotary' ? 0 : shape.transform.z
+          };
+          growBounds({ minX: b3.minX, minY: b3.minY, maxX: b3.maxX, maxY: b3.maxY });
+          continue;
         }
-
-        // Initialization
-        init(containerId) {
-            this.container = document.getElementById(containerId || 'operations-bucket-list');
-            if (this.container) {
-                this.container.addEventListener('keydown', (e) => this.handleKeydown(e));
+        const transformed = GeometryUtils.transformPrimitive(shape.primitive, m);
+        if (!transformed) continue;
+        // Per-operation dense identity (1..N).
+        const sourceId = ++shapeKeySeq;
+        (transformed.properties ||= {}).sourceId = sourceId;
+        operation.shapeKeyToNodeId.set(sourceId, sid);
+        // Stamp non-arc points so the Z channel carries identity through Clipper booleans.
+        if (transformed.contours) {
+          for (const c of transformed.contours) {
+            if (c.points) {
+              for (const pt of c.points) {
+                (!pt.curveId || pt.curveId <= 0) && (pt.sourceId = sourceId);
+              }
             }
-            this.updateEmptyState();
+          }
         }
-
-        setSceneResolver(fn) {
-            this._resolveScene = fn;
-        }
-
-        // Bucket CRUD
-        /**
-         * Creates a new operation bucket backed by a real operation in core.
-         * @param {CamCore} core - The core instance
-         * @param {Scene} scene - The scene instance
-         * @param {string} type - Operation type
-         * @param {string} label - Display label
-         * @param {string[]} shapeRefs - Shape IDs from scene
-         * @returns {string} The new bucket's ID (same as operation ID)
-         */
-        createBucket(core, scene, type, label, shapeRefs) {
-            const operation = core.createOperation(type, { label });
-            const bucket = new OperationBucket(operation.id, type, label, shapeRefs);
-            bucket.syncPrimitives(core, scene);
-            this.buckets.set(operation.id, bucket);
-            this.renderBucket(bucket);
-            this.updateEmptyState();
-            return operation.id;
-        }
-
-        removeBucket(bucketId, core) {
-            const bucket = this.buckets.get(bucketId);
-            if (!bucket) return;
-
-            const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucketId}"]`);
-            if (row) row.remove();
-
-            // Remove from core.operations[]
-            // REVIEW - What is this doing exactly? Is it a connection to the core operation creation? The base operation could remain in the core?
-            if (core) core.removeOperation(bucketId);
-
-            this.buckets.delete(bucketId);
-
-            if (this.selectedNode?.bucketId === bucketId) {
-                this.selectedNode = null;
-            }
-
-            this.updateEmptyState();
-            this.emit('bucketRemoved', { bucketId, bucket });
-        }
-
-        getBucket(bucketId) {
-            return this.buckets.get(bucketId) || null;
-        }
-
-        /**
-         * Returns all buckets that reference a given shape ID.
-         */
-        getBucketsForShape(shapeId) {
-            const result = [];
-            for (const bucket of this.buckets.values()) {
-                if (bucket.shapeRefs.includes(shapeId)) result.push(bucket);
-            }
-            return result;
-        }
-
-        /**
-         * Adds shape refs to an existing bucket. Invalidates if geometry was generated.
-         */
-        addShapesToBucket(bucketId, shapeIds, scene, core) {
-            const bucket = this.buckets.get(bucketId);
-            if (!bucket) return;
-
-            for (const id of shapeIds) {
-                const node = scene.findNode(id);
-                if (!node) continue;
-                if (node.kind === 'group') {
-                    for (const sid of scene.collectShapeIds(node)) {
-                        if (!bucket.shapeRefs.includes(sid)) bucket.shapeRefs.push(sid);
-                    }
-                } else if (node.kind === 'shape') {
-                    if (!bucket.shapeRefs.includes(id)) bucket.shapeRefs.push(id);
-                }
-            }
-
-            // Re-sync operation primitives with updated refs
-            if (core) bucket.syncPrimitives(core, scene);
-
-            if (bucket.hasOffsets) {
-                bucket.isInvalidated = true;
-                bucket.invalidatedReason = 'Source geometry changed. Regenerate offsets.';
-            }
-
-            this.updateBucketDOM(bucket);
-        }
-
-        removeShapeFromBucket(bucketId, shapeId) {
-            const bucket = this.buckets.get(bucketId);
-            if (!bucket) return;
-            bucket.shapeRefs = bucket.shapeRefs.filter(id => id !== shapeId);
-
-            if (bucket.hasOffsets) {
-                bucket.isInvalidated = true;
-                bucket.invalidatedReason = 'Source geometry changed. Regenerate offsets.';
-            }
-
-            this.updateBucketDOM(bucket);
-        }
-
-        // Generation State Updates
-
-        /**
-         * Called after handler.orchestrateGeneration succeeds.
-         * Writes results into the bucket and updates the DOM.
-         */
-        updateBucketAfterGeneration(bucketId, core) {
-            const bucket = this.buckets.get(bucketId);
-            if (!bucket) return;
-            bucket.syncStateFromOperation(core);
-            this.updateBucketDOM(bucket);
-        }
-
-        /**
-         * Clears a specific stage's generated geometry.
-         * Parallel to EasyTrace's handleDeleteGeometry.
-         */
-        clearBucketStage(bucketId, stage, core) {
-            const bucket = this.buckets.get(bucketId);
-            if (!bucket || !core) return;
-
-            const op = bucket.getOperation(core);
-            if (!op) return;
-
-            if (stage === 'preview') {
-                op.preview = null;
-                op.exportReady = false;
-            } else if (stage === 'offsets') {
-                op.offsets = [];
-                op.exportReady = false;   // no offsets → not exportable, even if a stale preview remains 
-                // REVIEW - just because offsets were deleted it technically doesn't mean the offsets are stale? Offssets can never be readed to a given bucket so the preview object is always updated.
-            }
-
-            bucket.syncStateFromOperation(core);
-            this.updateBucketDOM(bucket, core);
-            this.emit('stageCleared', { bucketId, stage });
-        }
-
-        // Selection
-        selectStage(bucketId, stage) {
-            // Clear all selection highlights
-            this.container.querySelectorAll('.bucket-header.selected, .stage-node.selected')
-                .forEach(el => el.classList.remove('selected'));
-
-            this.selectedNode = { bucketId, stage };
-
-            const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucketId}"]`);
-            if (!row) return;
-
-            if (stage === 'geometry') {
-                row.querySelector('.bucket-header')?.classList.add('selected');
-            } else {
-                const stageNode = row.querySelector(`.stage-node[data-stage="${stage}"]`);
-                if (stageNode) {
-                    stageNode.classList.add('selected');
-                } else {
-                    // Stage doesn't exist in DOM (data was deleted) - fall back to header
-                    row.querySelector('.bucket-header')?.classList.add('selected');
-                    this.selectedNode.stage = 'geometry';
-                }
-            }
-
-            this.emit('select', { bucketId, stage: this.selectedNode.stage });
-        }
-
-        getSelectedBucketId() {
-            return this.selectedNode?.bucketId || null;
-        }
-
-        getSelectedStage() {
-            return this.selectedNode?.stage || null;
-        }
-
-        // DOM Rendering
-        buildStages(bucket, container, core) {
-            container.innerHTML = '';
-            const intrinsicStages = ['offsets', 'preview'];
-
-            for (const stage of intrinsicStages) {
-                const hasData = (stage === 'offsets' && bucket.hasOffsets) ||
-                                (stage === 'preview' && bucket.hasPreview);
-                if (!hasData) continue;
-
-                const stageLabel = stage.charAt(0).toUpperCase() + stage.slice(1);
-
-                const node = document.createElement('div');
-                node.className = 'stage-node';
-                node.dataset.stage = stage;
-                node.setAttribute('tabindex', '-1');
-                node.setAttribute('role', 'treeitem');
-
-                const isInvalidated = stage === 'offsets' && core &&
-                    bucket.getOperation(core)?.isInvalidated && bucket.hasOffsets;
-
-                if (isInvalidated) node.classList.add('is-invalidated');
-
-                node.innerHTML = `
-                    <span class="stage-icon"><svg class="cam-icon" width="14" height="14"><use href="#icon-${stage}-stage"></use></svg></span>
-                    <span class="stage-label">${stageLabel}</span>
-                    <span class="stage-info"></span>
-                    <button class="btn btn--icon btn--compact stage-delete" data-action="delete-stage" title="Delete ${stageLabel}">
-                        <svg class="cam-icon" width="12" height="12"><use href="#icon-delete"></use></svg>
-                    </button>
-                `;
-
-                node.addEventListener('click', (e) => {
-                    if (e.target.closest('[data-action]')) {
-                        e.stopPropagation();
-                        this.emit('action', {
-                            bucketId: bucket.id,
-                            action: 'delete-stage',
-                            stage: stage
-                        });
-                        return;
-                    }
-                    this.selectStage(bucket.id, stage);
-                });
-
-                container.appendChild(node);
-            }
-        }
-
-        renderBucket(bucket) {
-            const row = document.createElement('div');
-            row.className = 'bucket-row';
-            row.dataset.bucketId = bucket.id;
-            row.dataset.op = bucket.type;
-            row.setAttribute('role', 'treeitem');
-
-            // Header
-            const header = document.createElement('div');
-            header.className = 'bucket-header';
-            header.setAttribute('tabindex', '-1');
-
-            header.innerHTML = `
-                <span class="bucket-icon"><svg class="cam-icon" width="14" height="14"><use href="#icon-op-${bucket.type}"></use></svg></span>
-                <span class="bucket-label"></span>
-                <span class="bucket-info">${bucket.shapeRefs.length} shape(s)</span>
-                <button class="btn btn--icon btn--compact bucket-delete" data-action="delete-bucket" title="Delete operation" aria-label="Delete operation">
-                    <svg class="cam-icon" width="12" height="12"><use href="#icon-delete"></use></svg>
-                </button>
-            `;
-            let displayLabel = bucket.label;
-            if (bucket.shapeRefs.length === 1) {
-                const shape = this._resolveScene?.()?.findShape(bucket.shapeRefs[0]);
-                if (shape?.label && shape.label !== 'Shape') displayLabel = shape.label;
-            }
-            header.querySelector('.bucket-label').textContent = displayLabel;
-
-            header.addEventListener('click', (e) => {
-                if (e.target.closest('[data-action]')) {
-                    e.stopPropagation();
-                    const action = e.target.closest('[data-action]').dataset.action;
-                    if (action === 'delete-bucket') {
-                        this.emit('action', { bucketId: bucket.id, action: 'delete' });
-                    }
-                    return;
-                }
-                // Click header = select geometry stage
-                this.selectStage(bucket.id, 'geometry');
-            });
-
-            row.appendChild(header);
-
-            // Stage nodes
-            const stages = document.createElement('div');
-            stages.className = 'bucket-stages';
-
-            this.buildStages(bucket, stages, null);
-
-            row.appendChild(stages);
-
-            // Insert before empty state
-            const emptyState = document.getElementById('ops-empty-state');
-            if (emptyState) {
-                this.container.insertBefore(row, emptyState);
-            } else {
-                this.container.appendChild(row);
-            }
-
-            this.updateStageInfo(bucket, row, null);
-        }
-
-        updateBucketDOM(bucket, core) {
-            const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucket.id}"]`);
-            if (!row) return;
-
-            row.querySelector('.bucket-label').textContent = bucket.label;
-            const infoEl = row.querySelector('.bucket-info');
-            if (infoEl) infoEl.textContent = `${bucket.shapeRefs.length} shape(s)`;
-
-            const stages = row.querySelector('.bucket-stages');
-            if (stages) {
-                this.buildStages(bucket, stages, core);
-            }
-
-            this.updateStageInfo(bucket, row, core);
-        }
-
-        updateStageInfo(bucket, row, core) {
-            // Offsets info
-            const offInfo = row.querySelector('.stage-node[data-stage="offsets"] .stage-info');
-            if (offInfo) {
-                const op = core ? bucket.getOperation(core) : null;
-                if (op?.offsets?.length > 0) {
-                    const count = op.offsets.reduce((s, o) => s + (o.primitives?.length || 0), 0);
-                    offInfo.textContent = `${count} path(s)`;
-                } else {
-                    offInfo.textContent = '';
-                }
-            }
-
-            // Preview info
-            const prvInfo = row.querySelector('.stage-node[data-stage="preview"] .stage-info');
-            if (prvInfo) {
-                prvInfo.textContent = bucket.hasPreview ? 'Ready' : '';
-            }
-        }
-
-        updateEmptyState() {
-            const isEmpty = this.buckets.size === 0;
-
-            const emptyState = document.getElementById('ops-empty-state');
-            if (emptyState) {
-                emptyState.style.display = isEmpty ? '' : 'none';
-            }
-
-            if (this.container) {
-                if (isEmpty) {
-                    this.container.removeAttribute('role');
-                    this.container.removeAttribute('aria-label');
-                } else {
-                    this.container.setAttribute('role', 'tree');
-                    this.container.setAttribute('aria-label', 'Operations');
-                }
-            }
-        }
-
-        refreshPanel() {
-            if (!this.container) return;
-            this.container.querySelectorAll('.bucket-row').forEach(r => r.remove());
-            for (const bucket of this.buckets.values()) {
-                this.renderBucket(bucket);
-            }
-            this.updateEmptyState();
-        }
-
-        // Keyboard Navigation
-        handleKeydown(e) {
-            if (!this.container) return;
-            const focused = document.activeElement;
-            if (!this.container.contains(focused)) return;
-
-            const rows = Array.from(this.container.querySelectorAll('.bucket-header, .stage-node:not(.is-gated)'));
-            const idx = rows.indexOf(focused);
-            if (idx === -1) return;
-
-            switch (e.key) {
-                case 'ArrowDown':
-                    e.preventDefault();
-                    if (rows[idx + 1]) { focused.setAttribute('tabindex', '-1'); rows[idx + 1].setAttribute('tabindex', '0'); rows[idx + 1].focus(); }
-                    break;
-                case 'ArrowUp':
-                    e.preventDefault();
-                    if (rows[idx - 1]) { focused.setAttribute('tabindex', '-1'); rows[idx - 1].setAttribute('tabindex', '0'); rows[idx - 1].focus(); }
-                    break;
-                case 'Enter': case ' ':
-                    e.preventDefault();
-                    focused.click();
-                    break;
-                case 'Delete': case 'Backspace':
-                    e.preventDefault();
-                    if (focused.classList.contains('bucket-header')) {
-                        const bucketId = focused.closest('.bucket-row')?.dataset.bucketId;
-                        if (bucketId) this.emit('action', { bucketId, action: 'delete' });
-                    } else if (focused.classList.contains('stage-node')) {
-                        const bucketId = focused.closest('.bucket-row')?.dataset.bucketId;
-                        const stage = focused.dataset.stage;
-                        if (bucketId && stage !== 'geometry') {
-                            this.emit('action', { bucketId, action: 'delete-stage', stage });
-                        }
-                    }
-                    break;
-            }
-        }
-
-        // Queries
-        getAllBuckets() { return Array.from(this.buckets.values()); }
-
-        getExportReadyBuckets() {
-            return this.getAllBuckets().filter(b => b.exportReady);
-        }
+        operation.primitives.push(transformed);
+        growBounds(transformed.getBounds());
+      }
+      operation.bounds = isFinite(bounds.minX) ? bounds : { minX: 0, minY: 0, maxX: 0, maxY: 0 };
     }
 
-    window.NavOperationsPanel = NavOperationsPanel;
-    window.OperationBucket = OperationBucket;
+    /**
+     * Input-renderer source for this bucket.
+     *
+     * bucket.settings is a FULL snapshot (saveCurrentState and
+     * captureFormStateForId write the whole merged param set), unlike a
+     * core operation's settings which holds only sparse overrides. So
+     * every key in it is authoritative and must be declared as an
+     * override - loadFromOperation reads opSettings ONLY inside the
+     * userOverrides branch, and passing a bare literal made it fall
+     * through to profile defaults and silently discard everything the
+     * user had entered.
+     */
+    toParamSource() {
+      const settings = this.settings || {};
+      return {
+        id: this.id,
+        type: this.type,
+        settings,
+        userOverrides: Object.keys(settings)
+      };
+    }
+
+    get hasOffsets() {
+      return this.cachedHasOffsets;
+    }
+
+    get hasPreview() {
+      return this.cachedHasPreview;
+    }
+
+    /**
+     * Invalidation is NOT mirrored here - it lives on the operation, and
+     * resetOperationState clears it at the start of every generation.
+     */
+    syncStateFromOperation(core) {
+      const op = core.store.getOperation(this.id)
+      if (!op) return;
+      this.cachedHasOffsets = op.offsets && op.offsets.length > 0;
+      this.cachedHasPreview = op.preview?.ready === true;
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Panel UI
+  // ────────────────────────────────────────────────────────────────────
+
+  class NavOperationsPanel extends EventEmitter {
+    constructor() {
+      // Event emitter
+      super();
+      this.container = null;
+      this.buckets = new Map();
+      this.selectedNode = null; // { bucketId, stage }
+      this.scene = null;
+      this.artifactsFor = null; // (opType) => string[], one tree node per artifact
+    }
+
+    // Initialization
+    init(containerId, scene, artifactsFor) {
+      this.scene = scene;
+      this.artifactsFor = artifactsFor;
+      this.container = document.getElementById(containerId || 'operations-bucket-list');
+      if (this.container) {
+        UIControls.setupTreeKeyboard(this.container, [
+          { selector: '.bucket-header', idFrom: el => el.closest('.bucket-row')?.dataset.bucketId },
+          { selector: '.stage-node',    idFrom: el => el.closest('.bucket-row')?.dataset.bucketId }
+        ], {
+          onSelect: (id, e) => e.target.click(),
+          onDelete: (bucketId, focused) => {
+            if (focused.classList.contains('bucket-header')) {
+              this.emit('action', { bucketId, action: 'delete' });
+              return;
+            }
+            const stage = focused.dataset.stage;
+            if (stage && stage !== 'geometry') {
+              this.emit('action', { bucketId, action: 'delete-stage', stage });
+            }
+          },
+          onKey: (key, id, focused) => {
+            if (key !== 'v' && key !== 'V') return;
+            const btn = focused.querySelector('.stage-visibility, .bucket-visibility');
+            if (btn) btn.click();
+          }
+        });
+      }
+      this.updateEmptyState();
+    }
+
+    // Bucket CRUD
+    /**
+     * Creates a new operation bucket backed by a real operation in core.
+     * @param {CamCore} core - The core instance
+     * @param {Scene} scene - The scene instance
+     * @param {string} type - Operation type
+     * @param {string} label - Display label
+     * @param {string[]} shapeRefs - Shape IDs from scene
+     * @returns {string} The new bucket's ID (same as operation ID)
+     */
+    createBucket(core, scene, type, label, shapeRefs) {
+      const operation = core.store.createOperation(type, { label });
+      const bucket = new OperationBucket(operation.id, type, label, shapeRefs);
+      bucket.syncPrimitives(core, scene);
+      this.buckets.set(operation.id, bucket);
+      this.renderBucket(bucket, core);
+      this.updateEmptyState();
+      return operation.id;
+    }
+
+    /**
+     * Detaches the bucket and its core operation and returns a token that
+     * restoreBucket() can put back. The core operation is the bucket's other
+     * half - a bucket without one has no parameters, offsets or toolpaths -
+     * so the two are removed and restored together.
+     */
+    removeBucket(bucketId, core) {
+      const bucket = this.buckets.get(bucketId);
+      if (!bucket) return null;
+      const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucketId}"]`);
+      const domIndex = row ? Array.from(this.container.children).indexOf(row) : -1;
+      row?.remove();
+
+      const opToken = core ? core.detachOperation(bucketId) : null;
+      this.buckets.delete(bucketId);
+      if (this.selectedNode?.bucketId === bucketId) this.selectedNode = null;
+      this.updateEmptyState();
+      this.emit('bucketRemoved', { bucketId, bucket });
+      return { bucket, opToken, domIndex, shapeRefs: [...bucket.shapeRefs] };
+    }
+
+    restoreBucket(token, core) {
+      if (!token?.bucket) return false;
+      const { bucket, opToken, domIndex, shapeRefs } = token;
+      if (opToken && core) core.attachOperation(opToken);
+      bucket.shapeRefs = [...shapeRefs];
+      this.buckets.set(bucket.id, bucket);
+      this.renderBucket(bucket, core);
+      const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucket.id}"]`);
+      const siblings = Array.from(this.container.children);
+      if (row && domIndex >= 0 && domIndex < siblings.length - 1) {
+        this.container.insertBefore(row, siblings[domIndex]);
+      }
+      this.updateEmptyState();
+      this.emit('bucketRestored', { bucketId: bucket.id, bucket });
+      return true;
+    }
+
+    getBucket(bucketId) {
+      return this.buckets.get(bucketId) || null;
+    }
+
+    // Generation State Updates
+
+    /**
+     * Called after handler.orchestrateGeneration succeeds.
+     * Writes results into the bucket and updates the DOM.
+     */
+    updateBucketAfterGeneration(bucketId, core) {
+      const bucket = this.buckets.get(bucketId);
+      if (!bucket) return;
+      bucket.syncStateFromOperation(core);
+      this.updateBucketDOM(bucket, core);
+    }
+
+    /**
+     * Clears one artifact and everything downstream of it. Core owns the
+     * cascade: preview.primitives ARE the offset primitives tagged in
+     * place, and a toolpath cannot outlive the geometry it was built from.
+     */
+    clearBucketStage(bucketId, stage, core) {
+      const bucket = this.buckets.get(bucketId);
+      if (!bucket || !core) return;
+      const op = core.store.getOperation(bucket.id);
+      if (!op) return;
+
+      if (stage === 'offsets') {
+        core.store.resetOperationState(bucketId);
+      } else {
+        core.store.deleteOperationGeometry(bucketId, stage);
+      }
+
+      bucket.syncStateFromOperation(core);
+      this.updateBucketDOM(bucket, core);
+      this.emit('stageCleared', { bucketId, stage });
+    }
+
+    /**
+     * Selects a bucket node and publishes it. The 'select' event is the
+     * ONLY path to the right panel so an early return here silently
+     * freezes the workflow rather than failing visibly.
+     * @param {string} bucketId
+     * @param {'geometry'|'offsets'|'preview'} stage
+     * @param {Event} [e] - click event, when the node is already known
+     */
+    selectStage(bucketId, stage, e = null) {
+      const row = this.container?.querySelector(`.bucket-row[data-bucket-id="${bucketId}"]`);
+      if (!row) return;
+
+      let target;
+      if (stage === 'geometry') {
+        target = row.querySelector('.bucket-header');
+      } else {
+        target = e?.target
+          ? e.target.closest('.stage-node')
+          : row.querySelector(`.stage-node[data-stage="${stage}"]`);
+
+        // Stage node is gone (data was deleted) - fall back to geometry.
+        if (!target) {
+          target = row.querySelector('.bucket-header');
+          stage = 'geometry';
+        }
+      }
+      if (!target) return;
+
+      // Single selection across the whole panel.
+      this.container.querySelectorAll('.bucket-header.selected, .stage-node.selected')
+        .forEach(el => { el.classList.remove('selected'); el.setAttribute('aria-selected', 'false'); });
+
+      target.classList.add('selected');
+      target.setAttribute('aria-selected', 'true');
+
+      // Tab re-entry follows the selection.
+      this.container.querySelectorAll('[role="treeitem"][tabindex="0"]')
+        .forEach(el => el.setAttribute('tabindex', '-1'));
+      target.setAttribute('tabindex', '0');
+
+      this.selectedNode = { bucketId, stage };
+      this.emit('select', { bucketId, stage });
+    }
+
+    /**
+     * Per-artifact visibility, stored on the OPERATION so it survives a bucket
+     * DOM rebuild and matches how EasyTrace persists the same choice.
+     * Unset reads as visible: a new artifact must never appear hidden.
+     */
+    isArtifactVisible(bucket, key, core) {
+      return core.store.getOperation(bucket.id)?.layerVisibility?.[key] !== false;
+    }
+
+    /**
+     * The header eye is the bucket's GENERATED master - offsets, preview,
+     * toolpath. It does NOT touch source: a shape's visibility belongs to
+     * the scene tree and nowhere else, and two owners on one layer is how
+     * an eye ended up open over geometry that would not draw.
+     * Each icon reads exactly one key, so the header and the stage rows
+     * cannot report different things about the same fact.
+     */
+    isBucketVisible(bucket, core) {
+      return core.store.getOperation(bucket.id)?.layerVisibility?.generated !== false;
+    }
+
+    toggleArtifactVisibility(bucketId, key, core) {
+      const op = core.store.getOperation(bucketId);
+      if (op) {
+        op.layerVisibility = op.layerVisibility || {};
+        op.layerVisibility[key] = op.layerVisibility[key] === false;
+        this.updateBucketDOM(this.buckets.get(bucketId), core);
+      }
+    }
+
+    // DOM Rendering
+    buildStages(bucket, container, core) {
+      container.innerHTML = '';
+      // One node per ARTIFACT the chain declares. A 3D operation has no
+      // preview node because tool compensation is already baked into
+      // its field; a laser operation has only offsets.
+      const artifacts = this.artifactsFor(bucket.type);
+      const registry = core?.registry;
+      const dimension = registry?.dimensionFor(bucket.type, core?.machineClassOf(core.store.getOperation(bucket.id)) || 'router') || null;
+      for (const stage of artifacts) {
+        const hasData = (stage === 'offsets' && bucket.hasOffsets) || (stage === 'preview' && bucket.hasPreview) ||
+                        (stage !== 'offsets' && stage !== 'preview' && !!core.store.getOperation(bucket.id)?.stamps?.[stage]);
+        if (!hasData) continue;
+        const stageLabel = registry.artifactLabel(stage, dimension);
+        const stageIcon = registry.artifactIcon(stage);
+        const node = document.createElement('div');
+        node.dataset.stage = stage;
+        node.className = 'stage-node';
+        node.setAttribute('role', 'treeitem');
+        node.setAttribute('aria-level', '2');
+        node.setAttribute('tabindex', '-1');
+        node.setAttribute('aria-selected', this.selectedNode?.bucketId === bucket.id && this.selectedNode?.stage === stage ? 'true' : 'false');
+        const isInvalidated = stage === 'offsets' && core && core.store.getOperation(bucket.id)?.isInvalidated && bucket.hasOffsets;
+        if (isInvalidated) node.classList.add('is-invalidated');
+        const visible = this.isArtifactVisible(bucket, stage, core);
+        // Presentation only - the master is a separate key with its
+        // own icon. Dimming is what tells the operator why a stage
+        // eye that reads "shown" is not drawing anything.
+        if (!this.isBucketVisible(bucket, core)) node.classList.add('is-muted');
+        node.innerHTML = `
+          <span class="stage-icon"><svg class="cam-icon" width="14" height="14" aria-hidden="true"><use href="#${stageIcon}"></use></svg></span>
+          <span class="stage-label"></span>
+          ${isInvalidated ? `<span class="visually-hidden">${i18n.html('panels.operations.invalidatedNote')}</span>` : ''}
+          <button class="btn btn--icon btn--compact stage-visibility" data-action="visibility" tabindex="-1" title="${i18n.html(visible ? 'common.hide' : 'common.show')}" aria-label="${i18n.html('panels.operations.stageVisibilityAria', { stage: stageLabel })}">
+            <svg class="cam-icon" width="12" height="12" aria-hidden="true"><use href="#${visible ? 'icon-eye' : 'icon-eye-off'}"></use></svg>
+          </button>
+          <button class="btn btn--icon btn--compact stage-delete" data-action="delete-stage" tabindex="-1" title="${i18n.html('panels.operations.deleteAria', { name: stageLabel })}" aria-label="${i18n.html('panels.operations.deleteAria', { name: stageLabel })}">
+            <svg class="cam-icon" width="12" height="12" aria-hidden="true"><use href="#icon-delete"></use></svg>
+          </button>
+        `;
+        node.querySelector('.stage-label').textContent = stageLabel;
+        node.addEventListener('click', e => {
+          const actionEl = e.target.closest('[data-action]');
+          if (actionEl) {
+            e.stopPropagation();
+            this.emit('action', { bucketId: bucket.id, action: actionEl.dataset.action, stage });
+            return;
+          }
+          this.selectStage(bucket.id, stage);
+        });
+        container.appendChild(node);
+      }
+      // The header is the treeitem and the stage list is its group, but
+      // they are DOM SIBLINGS - aria-owns is what makes the header own
+      // the group without restructuring the row.
+      const header = container.closest('.bucket-row')?.querySelector('.bucket-header');
+      if (header) {
+        if (container.children.length) {
+          header.setAttribute('aria-owns', container.id);
+          header.setAttribute('aria-expanded', 'true');
+        } else {
+          header.removeAttribute('aria-owns');
+          header.removeAttribute('aria-expanded');
+        }
+      }
+    }
+
+    renderBucket(bucket, core = null) {
+      const row = document.createElement('div');
+      row.className = 'bucket-row';
+      row.dataset.bucketId = bucket.id;
+      row.dataset.op = bucket.type;
+      // Structural wrapper only. The treeitem is the header, because the
+      // header is what takes focus.
+      row.setAttribute('role', 'none');
+
+      // Header
+      const header = document.createElement('div');
+      header.className = 'bucket-header';
+      header.setAttribute('role', 'treeitem');
+      header.setAttribute('aria-level', '1');
+      header.setAttribute('tabindex', '-1');
+      header.setAttribute('aria-selected', 'false');
+
+      const genVisible = this.isBucketVisible(bucket, core);
+      header.innerHTML = `
+        <span class="bucket-icon"><svg class="cam-icon" width="14" height="14" aria-hidden="true"><use href="#${core.registry.iconFor(bucket.type)}"></use></svg></span>
+        <span class="bucket-label"></span>
+        <span class="bucket-info">${i18n.html('panels.operations.shapeCount', { count: bucket.shapeRefs.length })}</span>
+        <button class="btn btn--icon btn--compact bucket-visibility" data-action="visibility" tabindex="-1" title="${i18n.html(genVisible ? 'panels.operations.hideGenerated' : 'panels.operations.showGenerated')}" aria-label="${i18n.html('panels.operations.generatedVisibilityAria')}">
+          <svg class="cam-icon" width="12" height="12" aria-hidden="true"><use href="#${genVisible ? 'icon-eye' : 'icon-eye-off'}"></use></svg>
+        </button>
+        <button class="btn btn--icon btn--compact bucket-delete" data-action="delete-bucket" tabindex="-1" title="${i18n.html('dialogs.deleteOperation.title')}" aria-label="${i18n.html('dialogs.deleteOperation.title')}">
+          <svg class="cam-icon" width="12" height="12" aria-hidden="true"><use href="#icon-delete"></use></svg>
+        </button>
+      `;
+
+      let displayLabel = bucket.label;
+      if (bucket.shapeRefs.length === 1) {
+        const shape = this.scene.findShape(bucket.shapeRefs[0]);
+        if (shape?.label && shape.label !== i18n.t('panels.scene.unnamedShape')) displayLabel = shape.label;
+      }
+      header.querySelector('.bucket-label').textContent = displayLabel;
+
+      header.addEventListener('click', e => {
+        const actionEl = e.target.closest('[data-action]');
+        if (actionEl) {
+          e.stopPropagation();
+          const action = actionEl.dataset.action;
+          this.emit('action', { bucketId: bucket.id, action: 'delete-bucket' === action ? 'delete' : action, stage: 'generated' });
+          return;
+        }
+        this.selectStage(bucket.id, 'geometry');
+      });
+
+      row.appendChild(header);
+
+      // Stage nodes
+      const stages = document.createElement('div');
+      stages.className = 'bucket-stages';
+      stages.id = `bucket-stages-${bucket.id}`;
+      stages.setAttribute('role', 'group');
+      row.appendChild(stages);
+
+      this.buildStages(bucket, stages, core);
+
+      // Insert before empty state
+      const emptyState = document.getElementById('ops-empty-state');
+      if (emptyState) this.container.insertBefore(row, emptyState);
+      else this.container.appendChild(row);
+
+      UIControls.seedRovingTabindex(this.container, '[role="treeitem"]');
+    }
+
+    updateBucketDOM(bucket, core) {
+      const row = this.container.querySelector(`.bucket-row[data-bucket-id="${bucket.id}"]`);
+      if (!row) return;
+
+      row.querySelector('.bucket-label').textContent = bucket.label;
+      const infoEl = row.querySelector('.bucket-info');
+      if (infoEl) infoEl.textContent = i18n.t('panels.operations.shapeCount', { count: bucket.shapeRefs.length });
+
+      // The header is not inside the subtree buildStages rebuilds, so its
+      // buttons need their own refresh, or they keep the state and the
+      // words they were born with.
+      const visBtn = row.querySelector('.bucket-visibility');
+      if (visBtn) {
+        const genVisible = this.isBucketVisible(bucket, core);
+        visBtn.title = i18n.t(genVisible ? 'panels.operations.hideGenerated' : 'panels.operations.showGenerated');
+        visBtn.setAttribute('aria-label', i18n.t('panels.operations.generatedVisibilityAria'));
+        visBtn.querySelector('use')?.setAttribute('href', genVisible ? '#icon-eye' : '#icon-eye-off');
+        row.classList.toggle('is-generated-hidden', !genVisible);
+      }
+      const deleteBtn = row.querySelector('.bucket-delete');
+      deleteBtn.title = i18n.t('dialogs.deleteOperation.title');
+      deleteBtn.setAttribute('aria-label', deleteBtn.title);
+
+      const stages = row.querySelector('.bucket-stages');
+      if (stages) {
+        // buildStages replaces the whole subtree, focus included.
+        UIControls.preserveTreeFocus(this.container, '[role="treeitem"]', () => this.buildStages(bucket, stages, core));
+      }
+    }
+
+    updateEmptyState() {
+      const isEmpty = this.buckets.size === 0;
+      const emptyState = document.getElementById('ops-empty-state');
+      if (emptyState) emptyState.style.display = isEmpty ? '' : 'none';
+
+      if (this.container) {
+        if (isEmpty) {
+          this.container.removeAttribute('role');
+          this.container.removeAttribute('aria-label');
+        } else {
+          this.container.setAttribute('role', 'tree');
+          this.container.setAttribute('aria-label', i18n.t('panels.operations.treeAria'));
+          UIControls.seedRovingTabindex(this.container, '[role="treeitem"]');
+        }
+      }
+    }
+
+    /** Operation type assigned to a shape via bucket membership, or null. */
+    getShapeOpType(shapeId) {
+      for (const bucket of this.buckets.values()) {
+        if (bucket.shapeRefs.includes(shapeId)) return bucket.type;
+      }
+      return null;
+    }
+
+    /** Queries */
+    getAllBuckets() {
+      return Array.from(this.buckets.values());
+    }
+  }
+
+  window.NavOperationsPanel = NavOperationsPanel;
 })();
